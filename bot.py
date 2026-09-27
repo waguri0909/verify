@@ -562,6 +562,7 @@ async def main():
         await bot.start(config.token)
     else:
         log.info("봇 비활성 모드 (웹만 실행)")
+        webverify.bot_status_fn = lambda: {"bot": "web-only", "guilds": 0}
         await asyncio.Event().wait()
 
 
