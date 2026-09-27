@@ -512,10 +512,19 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ 권한이 없어요 (관리자 전용)."
     elif isinstance(error, app_commands.TransformerError):
+        opt = getattr(error, "opt", None)
+        log.warning(
+            "슬래시 변환오류: option=%s value=%r transformer=%s err=%r",
+            getattr(opt, "name", "?"),
+            getattr(error, "value", "?"),
+            type(getattr(error, "transformer", None)).__name__,
+            error,
+        )
         msg = (
-            "❌ 입력값이 맞지 않아요.\n"
-            "• **채널** 칸 → 일반 텍스트 채널 선택 (음성/포럼/공지·역할 불가)\n"
-            "• **역할** 칸 → 역할 선택"
+            "❌ 입력값이 디스코드에서 봇까지 전달되지 않았어요.\n"
+            "1. 디스코드를 **완전 종료 후 재시작** (캐시 문제 1순위)\n"
+            "2. **채널·역할을 비우고** `/인증패널`만 입력 → 현재 채널에 게시되는지 확인\n"
+            "3. 그래도 안 되면 해당 채널이 텍스트 채널인지 확인 (음성/포럼/공지 불가)"
         )
     else:
         msg = f"❌ 오류: {error}"
