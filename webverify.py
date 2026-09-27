@@ -18,6 +18,7 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
@@ -435,6 +436,151 @@ def client_ip(request: web.Request) -> str:
     return request.remote or "unknown"
 
 
+def _load_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_json(path: Path, data: dict):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_webhook_url(url: str) -> bool:
+    """discord.com / discordapp.com (+ptb/canary) 의 /api/webhooks/ URL이면 통과."""
+    try:
+        p = urlparse(url.strip())
+    except ValueError:
+        return False
+    if p.scheme != "https":
+        return False
+    host = p.netloc.lower()
+    if "discord.com" not in host and "discordapp.com" not in host:
+        return False
+    return "/api/webhooks/" in p.path
+
+
+async def post_webhook(url: str, payload: dict) -> tuple[bool, str]:
+    """웹훅 POST. (성공여부, 상세) 반환."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+            async with s.post(url, json=payload) as r:
+                if r.status in (200, 204):
+                    return True, f"HTTP {r.status}"
+                body = (await r.text())[:200]
+                detail = f"HTTP {r.status} {body}"
+                log.warning("웹훅 전송 실패: %s", detail)
+                return False, detail
+    except Exception as e:
+        detail = str(e)[:200]
+        log.warning("웹훅 오류: %s", e)
+        return False, detail
+
+
+# ---------- 내부 API (봇 → 웹, X-Api-Key = WEB_SECRET) ----------
+def api_auth(request: web.Request) -> bool:
+    secret = env("WEB_SECRET")
+    return bool(secret) and hmac.compare_digest(request.headers.get("X-Api-Key", ""), secret)
+
+
+def need_auth(request: web.Request) -> web.Response | None:
+    if not api_auth(request):
+        return web.json_response({"detail": "unauthorized"}, status=401)
+    return None
+
+
+async def api_ping(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    return web.json_response({"ok": True})
+
+
+async def api_webhook_test(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        body = await request.json()
+        guild_id, url = int(body["guild"]), str(body.get("url", "")).strip()
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"detail": "guild/url 필요"}, status=400)
+    if not is_webhook_url(url):
+        return web.json_response({"ok": False, "detail": "웹훅 URL 형식 아님"}, status=200)
+    ok, detail = await post_webhook(
+        url,
+        {"embeds": [{"title": "🔗 인증 로그 연결됨", "description": "앞으로 인증 성공 시 여기에 로그가 전송됩니다.", "color": 0x57F287}]},
+    )
+    if ok:
+        hooks = _load_json(WEBHOOK_FILE)
+        hooks[str(guild_id)] = url
+        _save_json(WEBHOOK_FILE, hooks)
+    return web.json_response({"ok": ok, "detail": detail})
+
+
+async def api_webhook_remove(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        guild_id = int((await request.json())["guild"])
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    hooks = _load_json(WEBHOOK_FILE)
+    removed = str(guild_id) in hooks
+    if removed:
+        del hooks[str(guild_id)]
+        _save_json(WEBHOOK_FILE, hooks)
+    return web.json_response({"removed": removed})
+
+
+async def api_backup_count(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        guild_id = int(request.query["guild"])
+    except (KeyError, ValueError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE guild_id=?", (str(guild_id),)
+        ).fetchone()
+        return web.json_response({"count": row[0] if row else 0})
+    finally:
+        con.close()
+
+
+async def api_backup_users(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        guild_id = int(request.query["guild"])
+    except (KeyError, ValueError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    users = [
+        {"user_id": u, "access": a, "refresh": rf, "expires_at": e}
+        for (u, a, rf, e) in get_backed_users(guild_id)
+    ]
+    return web.json_response({"users": users})
+
+
+async def api_token_save(request: web.Request) -> web.Response:
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        body = await request.json()
+        save_tokens(
+            str(body["user_id"]), int(body["guild"]),
+            str(body.get("access", "")), str(body.get("refresh", "")),
+            int(body.get("expires_in", 0)),
+        )
+    except (ValueError, KeyError, TypeError) as e:
+        return web.json_response({"detail": f"입력 오류: {e}"}, status=400)
+    return web.json_response({"ok": True})
+
+
 # ---------- 라우트 ----------
 async def index(request: web.Request) -> web.Response:
     try:
@@ -585,4 +731,10 @@ def create_app() -> web.Application:
     app.router.add_get("/callback", callback)
     app.router.add_get("/health", health)
     app.router.add_get("/status", status)
+    app.router.add_get("/api/ping", api_ping)
+    app.router.add_post("/api/webhook-test", api_webhook_test)
+    app.router.add_post("/api/webhook-remove", api_webhook_remove)
+    app.router.add_get("/api/backup-count", api_backup_count)
+    app.router.add_get("/api/backup-users", api_backup_users)
+    app.router.add_post("/api/token-save", api_token_save)
     return app

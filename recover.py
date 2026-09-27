@@ -13,6 +13,7 @@ import time
 import aiohttp
 import discord
 
+import webapi
 from webverify import API, HEADERS, db, env
 
 log = logging.getLogger("recover")
@@ -55,15 +56,9 @@ def key_to_guild(key: str) -> int | None:
         con.close()
 
 
-def backup_count(guild_id: int) -> int:
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT COUNT(*) FROM oauth_tokens WHERE guild_id=?", (str(guild_id),)
-        ).fetchone()
-        return row[0] if row else 0
-    finally:
-        con.close()
+async def backup_count(guild_id: int) -> int:
+    """복구키에 쌓인 인원 (웹 API 경유)."""
+    return await webapi.backup_count(guild_id)
 
 
 async def find_inviter(guild: discord.Guild, bot_id: int) -> discord.User | discord.Member | None:
@@ -122,20 +117,27 @@ async def run_restore(
     progress_cb,
 ) -> dict:
     """백업 멤버 전원 복구. progress_cb(done, total) 호출. 결과 dict 반환."""
-    from webverify import get_backed_users, save_tokens
-
-    users = get_backed_users(source_guild)
+    users = await webapi.backup_users(source_guild)
     total = len(users)
     res = {"total": total, "ok": 0, "already": 0, "dead": 0, "fail": 0}
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
-        for i, (uid, access, refresh, exp) in enumerate(users, 1):
-            if int(exp or 0) < time.time() + 60:
+        for i, u in enumerate(users, 1):
+            uid = str(u.get("user_id", ""))
+            access = u.get("access", "") or ""
+            refresh = u.get("refresh", "") or ""
+            exp = int(u.get("expires_at") or 0)
+            if not uid or not access:
+                res["dead"] += 1
+                await progress_cb(i, total)
+                continue
+            if exp < time.time() + 60:
                 tok = await refresh_access(s, refresh)
                 if tok and tok.get("access_token"):
                     access = tok["access_token"]
-                    save_tokens(uid, source_guild, access,
-                                tok.get("refresh_token", refresh), tok.get("expires_in", 0))
+                    await webapi.token_save(uid, source_guild, access,
+                                            tok.get("refresh_token", refresh),
+                                            tok.get("expires_in", 0))
                 else:
                     res["dead"] += 1
                     await progress_cb(i, total)

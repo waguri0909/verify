@@ -17,15 +17,14 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 
-import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
 import recover
+import webapi
 import webverify
 
 load_dotenv()
@@ -93,10 +92,9 @@ webverify.bot_status_fn = _bot_status
 
 BASE_DIR = Path(__file__).parent
 PANEL_FILE = BASE_DIR / "panels.json"
-WEBHOOK_FILE = BASE_DIR / "webhooks.json"
 
 
-# ---------- 저장소 (panels.json / webhooks.json) ----------
+# ---------- 저장소 (panels.json) ----------
 def _load_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -121,11 +119,6 @@ def get_guild_panel_role(guild_id: int) -> int | None:
         if isinstance(v, dict) and v.get("guild") == guild_id and v.get("verified"):
             return int(v["verified"])
     return None
-
-
-def get_guild_webhook(guild_id: int) -> str | None:
-    url = _load_json(WEBHOOK_FILE).get(str(guild_id))
-    return url if isinstance(url, str) and url.startswith("http") else None
 
 
 # ---------- 롤/로그 헬퍼 ----------
@@ -166,39 +159,6 @@ async def send_log(guild: discord.Guild, text: str):
             await ch.send(text)
         except discord.Forbidden:
             log.warning("로그 채널 전송 권한 없음")
-
-
-def is_webhook_url(url: str) -> bool:
-    """discord.com / discordapp.com (+ptb/canary) 의 /api/webhooks/ URL이면 통과."""
-    try:
-        p = urlparse(url.strip())
-    except ValueError:
-        return False
-    if p.scheme != "https":
-        return False
-    host = p.netloc.lower()
-    if "discord.com" not in host and "discordapp.com" not in host:
-        return False
-    return "/api/webhooks/" in p.path
-
-
-async def post_webhook(url: str, payload: dict) -> tuple[bool, str]:
-    """웹훅 POST. (성공여부, 상세) 반환."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        headers = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
-            async with s.post(url, json=payload) as r:
-                if r.status in (200, 204):
-                    return True, f"HTTP {r.status}"
-                body = (await r.text())[:200]
-                detail = f"HTTP {r.status} {body}"
-                log.warning("웹훅 전송 실패: %s", detail)
-                return False, detail
-    except Exception as e:
-        detail = str(e)[:200]
-        log.warning("웹훅 오류: %s", e)
-        return False, detail
 
 
 # ---------- 인증 패널 (웹 링크 버튼) ----------
@@ -359,11 +319,11 @@ async def setup_panel(
             ephemeral=True,
         )
         return
-    werrs = webverify.validate()
-    if werrs:
+    try:
+        await webapi.api_ping()
+    except webapi.ApiError as e:
         await interaction.response.send_message(
-            "❌ 웹 인증 설정이 없습니다:\n- " + "\n- ".join(werrs)
-            + "\n(.env에 DISCORD_CLIENT_ID / DISCORD_CLIENT_SECRET / WEB_PUBLIC_URL / WEB_SECRET 필요)",
+            f"❌ 웹 서버에 연결할 수 없습니다: {e}",
             ephemeral=True,
         )
         return
@@ -393,8 +353,13 @@ async def recover_status(interaction: discord.Interaction, 키: str):
     if gid is None:
         await interaction.response.send_message("❌ 유효하지 않은 복구키입니다.", ephemeral=True)
         return
-    n = recover.backup_count(gid)
-    await interaction.response.send_message(
+    await interaction.response.defer(ephemeral=True)
+    try:
+        n = await recover.backup_count(gid)
+    except webapi.ApiError as e:
+        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        return
+    await interaction.followup.send(
         f"🔑 이 복구키에 **{n}명** 쌓여 있습니다.\n(웹 인증 + 참가 승인을 한 사람만 복구 가능)",
         ephemeral=True,
     )
@@ -416,7 +381,12 @@ async def recover_run(interaction: discord.Interaction, 키: str):
             "❌ 봇에 **멤버 초대하기** 권한이 없습니다. 역할 설정을 확인해주세요.", ephemeral=True
         )
         return
-    total = recover.backup_count(gid)
+    total = 0
+    try:
+        total = await recover.backup_count(gid)
+    except webapi.ApiError as e:
+        await interaction.response.send_message(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        return
     if total == 0:
         await interaction.response.send_message("❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True)
         return
@@ -475,31 +445,25 @@ async def set_verify_log(interaction: discord.Interaction, 웹훅: str):
     guild = interaction.guild
     assert guild is not None
     url = 웹훅.strip()
-    if not is_webhook_url(url):
-        await interaction.response.send_message(
-            "❌ 올바른 디스코드 웹훅 URL이 아니에요. `https://discord.com/api/webhooks/...` 형태여야 해요.",
-            ephemeral=True,
-        )
-        return
     await interaction.response.defer(ephemeral=True)
-    ok, detail = await post_webhook(
-        url,
-        {"embeds": [{"title": "🔗 인증 로그 연결됨", "description": "앞으로 인증 성공 시 여기에 로그가 전송됩니다.", "color": 0x57F287}]},
-    )
+    try:
+        ok, detail = await webapi.webhook_test(guild.id, url)
+    except webapi.ApiError as e:
+        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        return
     if not ok:
         hint = ""
         if "404" in detail:
             hint = "\n💡 404 = 웹훅이 삭제됐거나 URL 오타. 채널 설정 → 연동 → 웹훅에서 URL을 다시 복사해주세요."
         elif "401" in detail or "403" in detail:
             hint = "\n💡 401/403 = 토큰이 유효하지 않음. 웹훅을 새로 만드세요."
+        elif "형식" in detail:
+            hint = "\n💡 `https://discord.com/api/webhooks/...` 형태여야 해요."
         await interaction.followup.send(
             f"❌ 웹훅 전송 테스트 실패.\n상세: `{detail}`{hint}",
             ephemeral=True,
         )
         return
-    hooks = _load_json(WEBHOOK_FILE)
-    hooks[str(guild.id)] = url
-    _save_json(WEBHOOK_FILE, hooks)
     await interaction.followup.send("✅ 인증 로그 웹훅이 설정됐어요. 테스트 메시지를 보냈으니 확인해보세요.", ephemeral=True)
 
 
@@ -508,10 +472,12 @@ async def set_verify_log(interaction: discord.Interaction, 웹훅: str):
 async def remove_verify_log(interaction: discord.Interaction):
     guild = interaction.guild
     assert guild is not None
-    hooks = _load_json(WEBHOOK_FILE)
-    if str(guild.id) in hooks:
-        del hooks[str(guild.id)]
-        _save_json(WEBHOOK_FILE, hooks)
+    try:
+        removed = await webapi.webhook_remove(guild.id)
+    except webapi.ApiError as e:
+        await interaction.response.send_message(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        return
+    if removed:
         await interaction.response.send_message("✅ 인증 로그 웹훅을 해제했어요.", ephemeral=True)
     else:
         await interaction.response.send_message("설정된 웹훅이 없어요.", ephemeral=True)
@@ -554,14 +520,23 @@ async def main():
         print("❌ " + "\n".join(errs))
         print("→ .env.example을 .env로 복사하고 DISCORD_TOKEN을 채우세요.")
         raise SystemExit(1)
-    for e in webverify.validate():
-        log.warning("웹 인증 미설정: %s (/인증패널 사용 전 .env에 추가)", e)
-    # 웹 + 봇 동시 실행 (무료 호스팅 1서비스용)
-    runner = web.AppRunner(webverify.create_app())
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", config.web_port).start()
-    log.info("웹 실행: 포트 %s (/health)", config.web_port)
-    await bot.start(config.token)
+    do_web = os.getenv("DISABLE_WEB", "").lower() not in ("1", "true", "yes")
+    do_bot = os.getenv("DISABLE_BOT", "").lower() not in ("1", "true", "yes")
+    if not do_web and not do_bot:
+        print("❌ DISABLE_WEB과 DISABLE_BOT이 둘 다 켜져 있습니다.")
+        raise SystemExit(1)
+    if do_web:
+        for e in webverify.validate():
+            log.warning("웹 인증 미설정: %s", e)
+        runner = web.AppRunner(webverify.create_app())
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", config.web_port).start()
+        log.info("웹 실행: 포트 %s (/health)", config.web_port)
+    if do_bot:
+        await bot.start(config.token)
+    else:
+        log.info("봇 비활성 모드 (웹만 실행)")
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":

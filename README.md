@@ -38,7 +38,21 @@ python bot.py   # 봇 + 웹(:8000) 동시 실행
    - 포털 OAuth2 Redirects에 `https://xxx.onrender.com/callback` 등록
    - Render 환경변수 `WEB_PUBLIC_URL`에 `https://xxx.onrender.com` 입력 → 재배포
 5. 주의: 무료 플랜은 15분 무사용 시 슬립 → 첫 인증이 30초쯤 느릴 수 있음.
-   24시간 즉시반응이 필요하면 유료 플랜 or Oracle 무료 VPS 고려.
+   24시간 즉시반응이 필요하면 유료 플랜 or 아래 분리 구성을 고려.
+
+## 3-2. 분리 구성 (봇=디스호스트 24시간 + 웹=Render)
+Render 슬립 때문에 봇 명령어가 자주 죽는다면:
+- **웹(Render)**: 그대로. `DISABLE_BOT=1` 환경변수 추가 → 웹만 실행
+- **봇(디스호스트)**: Python 서버 생성 → 이 폴더 파일 업로드
+  (`bot.py`, `webverify.py`, `webapi.py`, `recover.py`, `requirements.txt`)
+  → 시작 명령 `python bot.py` → 환경변수 설정 후 실행:
+  `DISCORD_TOKEN`, `WEB_PUBLIC_URL`(Render 주소), `WEB_SECRET`(Render와 동일),
+  `VERIFIED_ROLE_NAME`, `UNVERIFIED_ROLE_NAME`, `DISABLE_WEB=1`
+  (+ 선택: `AUTH_CHANNEL_ID`, `LOG_CHANNEL_ID`, `GUILD_ID`)
+  ※ `DISCORD_CLIENT_SECRET`은 웹 쪽에만 있으면 됨 (봇 쪽 불필요)
+  ※ 디스호스트는 7일마다 연장 클릭 필요, 무료 128MB라 로그で 확인
+- 봇↔웹 통신은 `X-Api-Key: WEB_SECRET` 로 인증 (`/api/*`)
+- 두 곳 토큰이 같으면 세션 충돌 → 반드시 한쪽은 봇 끄기 (위 플래그)
 
 ## 4. 디스코드 명령 (관리자)
 - `/인증패널 역할:@롤 채널:#인증 제목:.. 문장1:.. 문장2:..` → 웹인증 링크 패널 게시
