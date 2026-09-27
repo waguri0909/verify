@@ -306,7 +306,7 @@ async def on_member_join(member: discord.Member):
 # ---------- 슬래시 명령 ----------
 @tree.command(name="인증패널", description="인증 패널 게시 + 역할/문구 지정 (관리자)")
 @app_commands.describe(
-    채널="패널 올릴 채널 (비우면 현재 채널)",
+    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
     역할="인증하면 지급할 역할 (비우면 .env 기본값)",
     제목="패널 제목 (비우면 기본값)",
     문장1="맨 위 문장: 환영 문구 (비우면 기본값)",
@@ -315,15 +315,23 @@ async def on_member_join(member: discord.Member):
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setup_panel(
     interaction: discord.Interaction,
-    채널: discord.TextChannel | None = None,
+    채널: discord.abc.GuildChannel | None = None,
     역할: discord.Role | None = None,
     제목: str | None = None,
     문장1: str | None = None,
     문장2: str | None = None,
 ):
     target = 채널 or interaction.channel
+    if isinstance(target, discord.Thread):
+        target = target.parent
     if not isinstance(target, discord.TextChannel):
-        await interaction.response.send_message("텍스트 채널에서 사용해주세요.", ephemeral=True)
+        got = getattr(target, "mention", "선택한 항목")
+        await interaction.response.send_message(
+            f"❌ {got}에는 패널을 올릴 수 없어요.\n"
+            f"**채널** 칸에는 일반 **텍스트 채널**을 골라주세요. (음성/포럼/공지/카테고리·역할 불가)\n"
+            f"비워두면 명령을 입력한 현재 채널에 게시됩니다.",
+            ephemeral=True,
+        )
         return
     guild = interaction.guild
     assert guild is not None
@@ -503,6 +511,12 @@ async def remove_verify_log(interaction: discord.Interaction):
 async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         msg = "❌ 권한이 없어요 (관리자 전용)."
+    elif isinstance(error, app_commands.TransformerError):
+        msg = (
+            "❌ 입력값이 맞지 않아요.\n"
+            "• **채널** 칸 → 일반 텍스트 채널 선택 (음성/포럼/공지·역할 불가)\n"
+            "• **역할** 칸 → 역할 선택"
+        )
     else:
         msg = f"❌ 오류: {error}"
         log.exception("slash error: %s", error)
