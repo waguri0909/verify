@@ -347,6 +347,30 @@ async def setup_panel(
     await interaction.response.send_message(desc, ephemeral=True)
 
 
+@tree.command(name="복구키확인", description="이 서버의 복구키 확인/발급 (관리자 DM으로 전송)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def recover_key_check(interaction: discord.Interaction):
+    guild = interaction.guild
+    assert guild is not None
+    key, is_new = recover.ensure_key(guild.id, interaction.user.id)
+    text = (
+        f"🔑 **{guild.name} 서버의 복구키**\n`{key}`\n\n"
+        f"• 이 서버에서 웹 인증하는 사람이 이 키 앞으로 자동 누적됩니다.\n"
+        f"• 테러 후 새 서버에서 `/복구 키:{key}` → 멤버 재초대, `/복구현황 키:{key}` → 인원 확인\n"
+        f"⚠️ 절대 공유하지 마세요!"
+    )
+    try:
+        await interaction.user.send(text)
+        await interaction.response.send_message(
+            f"✅ 복구키를 DM으로 보냈어요.{' (새로 발급됨)' if is_new else ''}", ephemeral=True
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.response.send_message(
+            f"⚠️ DM이 막혀 있어 여기에 표시합니다. 확인 후 이 메시지를 지우세요.\n{text}",
+            ephemeral=True,
+        )
+
+
 @tree.command(name="복구현황", description="복구키에 쌓인 인원 확인 (관리자)")
 @app_commands.describe(키="봇 초대 시 DM으로 받은 복구키")
 @app_commands.checks.has_permissions(manage_guild=True)
