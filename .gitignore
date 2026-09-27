@@ -1,0 +1,7 @@
+# 시크릿/개인정보 — GitHub에 절대 올라가면 안 됨
+.env
+*.db
+*.log
+__pycache__/
+panels.json
+webhooks.json
