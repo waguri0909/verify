@@ -79,7 +79,17 @@ def _guild_name(gid: int) -> str | None:
     return g.name if g else None
 
 
+def _bot_status() -> dict:
+    try:
+        if bot.is_closed():
+            return {"bot": "down", "guilds": 0}
+        return {"bot": "ready" if bot.is_ready() else "connecting", "guilds": len(bot.guilds)}
+    except Exception:
+        return {"bot": "unknown", "guilds": 0}
+
+
 webverify.guild_name_fn = _guild_name
+webverify.bot_status_fn = _bot_status
 
 BASE_DIR = Path(__file__).parent
 PANEL_FILE = BASE_DIR / "panels.json"

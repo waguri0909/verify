@@ -403,6 +403,7 @@ def page(title: str, msg: str, ok: bool) -> web.Response:
 
 
 guild_name_fn = None  # bot.py에서 설정: (guild_id) -> 서버명 | None (봇 캐시)
+bot_status_fn = None  # bot.py에서 설정: () -> {"bot": ready/down, "guilds": N}
 
 
 async def resolve_guild(s: aiohttp.ClientSession, guild_id: int) -> tuple[str | None, str | None]:
@@ -568,9 +569,20 @@ async def health(_: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+async def status(_: web.Request) -> web.Response:
+    info: dict = {"web": "ok"}
+    if bot_status_fn:
+        try:
+            info.update(bot_status_fn())
+        except Exception:
+            info["bot"] = "unknown"
+    return web.json_response(info)
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/callback", callback)
     app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
     return app
