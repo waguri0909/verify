@@ -8,6 +8,7 @@
 
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -370,13 +371,20 @@ async def notify_webhook(embed: dict):
 
 # ---------- HTML ----------
 CSS = (
-    "body{margin:0;background:#0b0e1a;color:#fff;font-family:sans-serif;"
-    "display:flex;justify-content:center;align-items:center;min-height:100vh}"
-    ".card{background:#161a2b;border:1px solid #2a2f45;border-radius:16px;"
-    "padding:40px 48px;text-align:center;max-width:420px}"
+    "body{margin:0;min-height:100vh;color:#fff;font-family:'Pretendard',sans-serif;"
+    "background:#0b0e1a radial-gradient(600px 400px at 50% 20%,#1c2140 0%,#0b0e1a 70%);"
+    "display:flex;justify-content:center;align-items:center}"
+    ".card{background:rgba(22,26,43,.85);backdrop-filter:blur(8px);"
+    "border:1px solid #2a2f45;border-radius:20px;padding:48px 56px;text-align:center;"
+    "max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.5)}"
+    ".icon{width:96px;height:96px;border-radius:50%;object-fit:cover;margin:0 auto 16px;display:block}"
+    ".lock{font-size:56px;margin-bottom:8px}"
+    "h1{margin:0 0 28px;font-size:28px;font-weight:800}"
+    "p{color:#b5bac1;font-size:15px;line-height:1.7}"
     ".ok{color:#57f287}.no{color:#ed4245}"
-    "a.btn{display:inline-block;margin-top:20px;background:#5865f2;color:#fff;"
-    "padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:bold}"
+    "a.btn{display:inline-block;background:#5865f2;color:#fff;font-size:17px;font-weight:700;"
+    "padding:14px 56px;border-radius:10px;text-decoration:none;transition:.15s}"
+    "a.btn:hover{background:#4752c4;transform:translateY(-1px)}"
 )
 
 
@@ -392,6 +400,31 @@ def page(title: str, msg: str, ok: bool) -> web.Response:
         f"</body></html>",
         content_type="text/html",
     )
+
+
+guild_name_fn = None  # bot.py에서 설정: (guild_id) -> 서버명 | None (봇 캐시)
+
+
+async def resolve_guild(s: aiohttp.ClientSession, guild_id: int) -> tuple[str | None, str | None]:
+    """(서버명, 아이콘URL). 봇 캐시 우선, 실패 시 REST."""
+    if guild_name_fn:
+        try:
+            name = guild_name_fn(guild_id)
+            if name:
+                return name, None
+        except Exception:
+            pass
+    try:
+        headers = {**HEADERS, "Authorization": f"Bot {env('DISCORD_TOKEN')}"}
+        async with s.get(f"{API}/guilds/{guild_id}", headers=headers) as r:
+            if r.status != 200:
+                return None, None
+            d = await r.json()
+            icon = d.get("icon")
+            icon_url = f"https://cdn.discordapp.com/icons/{guild_id}/{icon}.png?size=128" if icon else None
+            return d.get("name"), icon_url
+    except Exception:
+        return None, None
 
 
 def client_ip(request: web.Request) -> str:
@@ -411,14 +444,24 @@ async def index(request: web.Request) -> web.Response:
     if parse_state(sign_state(guild_id, role_id)) != (guild_id, role_id):
         return page("설정 오류", "서버 설정이 올바르지 않습니다. 관리자에게 문의하세요.", False)
     url = build_authorize_url(guild_id, role_id)
+    timeout = aiohttp.ClientTimeout(total=8)
+    name, icon = None, None
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
+            name, icon = await resolve_guild(s, guild_id)
+    except Exception:
+        pass
+    title = html.escape(name) if name else "서버 인증"
+    visual = (
+        f"<img class=icon src='{icon}' alt=''>" if icon
+        else "<div class=lock>🔐</div>"
+    )
     return web.Response(
         text=f"<!doctype html><html lang=ko><head><meta charset=utf-8>"
         f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>서버 인증</title><style>{CSS}</style></head><body>"
-        f"<div class=card><h1>🔐 서버 인증</h1>"
-        f"<p>아래 버튼을 눌러 Discord 계정으로 인증하세요.<br>"
-        f"이메일 인증 여부와 중복 접속 기록을 확인합니다.</p>"
-        f"<a class=btn href='{url}'>Discord로 인증하기</a></div></body></html>",
+        f"<title>{title}</title><style>{CSS}</style></head><body>"
+        f"<div class=card>{visual}<h1>{title}</h1>"
+        f"<a class=btn href='{url}'>인증하기</a></div></body></html>",
         content_type="text/html",
     )
 

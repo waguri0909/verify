@@ -73,6 +73,14 @@ intents.guilds = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+
+def _guild_name(gid: int) -> str | None:
+    g = bot.get_guild(gid)
+    return g.name if g else None
+
+
+webverify.guild_name_fn = _guild_name
+
 BASE_DIR = Path(__file__).parent
 PANEL_FILE = BASE_DIR / "panels.json"
 WEBHOOK_FILE = BASE_DIR / "webhooks.json"
