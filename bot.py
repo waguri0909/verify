@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 import discord
 from aiohttp import web
@@ -330,8 +331,11 @@ async def setup_panel(
         )
         return
     # 랜딩 페이지를 거쳐 승인 → 스코프가 바뀌어도 기존 패널이 그대로 유효
+    # 서버명/아이콘도 링크에 포함 (웹에서 API 조회 없이 표시)
     base = webverify.env("WEB_PUBLIC_URL").rstrip("/")
-    url = f"{base}/?guild={guild.id}&role={verified.id}"
+    gparam = f"&g={url_quote(guild.name[:50], safe='')}"
+    iparam = f"&i={guild.icon.key}" if guild.icon else ""
+    url = f"{base}/?guild={guild.id}&role={verified.id}{gparam}{iparam}"
     embed = build_panel(verified, 제목, 문장1, 문장2)
     msg = await target.send(embed=embed, view=link_view(url))
     panels = _load_json(PANEL_FILE)

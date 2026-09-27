@@ -18,7 +18,7 @@ import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import aiohttp
 from aiohttp import web
@@ -420,6 +420,7 @@ async def resolve_guild(s: aiohttp.ClientSession, guild_id: int) -> tuple[str | 
         headers = {**HEADERS, "Authorization": f"Bot {env('DISCORD_TOKEN')}"}
         async with s.get(f"{API}/guilds/{guild_id}", headers=headers) as r:
             if r.status != 200:
+                log.warning("서버명 조회 실패: guild=%s HTTP %s", guild_id, r.status)
                 return None, None
             d = await r.json()
             icon = d.get("icon")
@@ -591,13 +592,25 @@ async def index(request: web.Request) -> web.Response:
     if parse_state(sign_state(guild_id, role_id)) != (guild_id, role_id):
         return page("설정 오류", "서버 설정이 올바르지 않습니다. 관리자에게 문의하세요.", False)
     url = build_authorize_url(guild_id, role_id)
-    timeout = aiohttp.ClientTimeout(total=8)
-    name, icon = None, None
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
-            name, icon = await resolve_guild(s, guild_id)
-    except Exception:
-        pass
+    # 1순위: 패널 링크에 박힌 서버명/아이콘 (봇이 직접 전달, API 불필요)
+    given_name = unquote(request.query.get("g", ""))[:50]
+    given_icon = request.query.get("i", "")
+    if given_name:
+        name = given_name
+        icon = (
+            f"https://cdn.discordapp.com/icons/{guild_id}/{given_icon}.png?size=128"
+            if len(given_icon) == 32 and all(c in "0123456789abcdef" for c in given_icon.lower())
+            else None
+        )
+    else:
+        # 2순위: 봇 캐시 → Discord API 조회 (구 패널 호환)
+        timeout = aiohttp.ClientTimeout(total=8)
+        name, icon = None, None
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
+                name, icon = await resolve_guild(s, guild_id)
+        except Exception:
+            pass
     title = html.escape(name) if name else "서버 인증"
     visual = (
         f"<img class=icon src='{icon}' alt=''>" if icon
