@@ -196,7 +196,9 @@ def link_view(url: str) -> discord.ui.View:
 # ---------- 이벤트 ----------
 @bot.event
 async def on_ready():
-    errors = config.validate() + webverify.validate()
+    errors = config.validate()
+    if os.getenv("DISABLE_WEB", "").lower() not in ("1", "true", "yes"):
+        errors += webverify.validate()  # 봇 전용 모드에서는 웹 키 불필요
     if errors:
         log.error("설정 오류: %s", errors)
     else:
