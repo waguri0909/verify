@@ -710,4 +710,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # 패널의 Stop/재시작이 보내는 중지 신호. 스택트레이스 대신 한 줄로 정리.
+        print("\n⏹ 중지 신호를 받아 종료했습니다.", flush=True)
