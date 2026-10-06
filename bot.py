@@ -1,7 +1,8 @@
-"""Discord 웹 OAuth 인증봇.
+"""Discord 종합봇 (웹 OAuth 인증 + 티켓).
 
-흐름: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
+인증: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
 이메일인증여부/중복IP 검사 → REST로 역할 지급.
+티켓: 패널 [티켓 열기] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
 봇+웹이 한 프로세스로 뜸 (무료 호스팅 1서비스용).
 
 실행:
@@ -17,6 +18,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote as url_quote
 
 import discord
@@ -25,13 +27,14 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import recover
+import ticket
 import webapi
 import webverify
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("verify-bot")
+log = logging.getLogger("bot")
 
 
 # ---------- 설정 (.env) ----------
@@ -53,7 +56,6 @@ class Config:
     auth_channel_id: int | None = _get_int("AUTH_CHANNEL_ID")
     log_channel_id: int | None = _get_int("LOG_CHANNEL_ID")
     min_account_age_days: int = int(os.getenv("MIN_ACCOUNT_AGE_DAYS", "7") or 7)
-    guild_id: int | None = _get_int("GUILD_ID")
     web_port: int = int(os.getenv("PORT", "") or os.getenv("WEB_PORT", "8000") or 8000)
 
     def validate(self) -> list[str]:
@@ -72,6 +74,12 @@ intents.guilds = True
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+
+# 티켓 — 재시작 후에도 버튼이 계속 동작하도록 persistent view 등록
+ticket.bind(bot=bot, guild_fn=bot.get_guild)
+bot.add_view(ticket.PanelView())
+bot.add_view(ticket.TicketView())
+bot.add_view(ticket.ClosedTicketView())
 
 
 def _guild_name(gid: int) -> str | None:
@@ -190,11 +198,23 @@ def build_panel(
 
 def link_view(url: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="웹에서 인증하기 🌐", url=url))
+    view.add_item(discord.ui.Button(label="인증하기", url=url))
     return view
 
 
 # ---------- 이벤트 ----------
+def _sync_targets() -> list[int]:
+    """명령을 즉시 반영할 서버 목록. ALLOWED_GUILDS → GUILD_ID 순서로 읽음."""
+    raw = os.getenv("ALLOWED_GUILDS", "").strip() or os.getenv("GUILD_ID", "").strip()
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) not in out:
+            out.append(int(part))
+    # 이미 나간 서버는 제외 (403 동기화 오류 방지)
+    return [g for g in out if bot.get_guild(g) is not None]
+
+
 @bot.event
 async def on_ready():
     errors = config.validate()
@@ -204,16 +224,29 @@ async def on_ready():
         log.error("설정 오류: %s", errors)
     else:
         log.info("로그인: %s", bot.user)
+
+    # 1) 길드 단위 → 즉시 반영 (실패해도 이어서 전역 진행)
+    synced: list[int] = []
+    for gid in _sync_targets():
+        try:
+            obj = discord.Object(id=gid)
+            tree.copy_global_to(guild=obj)
+            await tree.sync(guild=obj)
+            synced.append(gid)
+        except Exception as e:
+            log.warning("길드 %s 명령 동기화 실패: %s", gid, e)
+    # 2) 전역 → 향후 새로 초대되는 서버용 (최대 1시간 반영)
     try:
-        if config.guild_id:
-            guild = discord.Object(id=config.guild_id)
-            tree.copy_global_to(guild=guild)
-            await tree.sync(guild=guild)
-        else:
-            await tree.sync()
-        log.info("슬래시 명령 동기화 완료")
+        await tree.sync()
     except Exception as e:
-        log.exception("명령 동기화 실패: %s", e)
+        log.exception("전역 명령 동기화 실패: %s", e)
+        if synced:
+            log.info("슬래시 명령 동기화: 길드 %d개는 이미 반영됨", len(synced))
+        return
+    if synced:
+        log.info("슬래시 명령 동기화 완료 (길드 %d개 즉시 반영 + 전역)", len(synced))
+    else:
+        log.info("슬래시 명령 동기화 완료 (전역)")
 
 
 @bot.event
@@ -511,6 +544,132 @@ async def remove_verify_log(interaction: discord.Interaction):
         await interaction.response.send_message("✅ 인증 로그 웹훅을 해제했어요.", ephemeral=True)
     else:
         await interaction.response.send_message("설정된 웹훅이 없어요.", ephemeral=True)
+
+
+# ---------- 슬래시 명령: 티켓 ----------
+@tree.command(name="티켓패널", description="티켓 패널 게시 (버튼 → 전용 티켓 채널)")
+@app_commands.describe(
+    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
+    제목="패널 제목 (비우면 기본값)",
+    설명="패널 안내 문구 (비우면 기본값)",
+    역할="티켓 스태프 역할 (지정하면 티켓 설정에도 저장)",
+    카테고리="티켓이 생성될 카테고리 (지정하면 티켓 설정에도 저장)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_panel(
+    interaction: discord.Interaction,
+    채널: discord.abc.GuildChannel | None = None,
+    제목: str | None = None,
+    설명: str | None = None,
+    역할: discord.Role | None = None,
+    카테고리: discord.abc.GuildChannel | None = None,
+):
+    target = 채널 or interaction.channel
+    if isinstance(target, discord.Thread):
+        target = target.parent
+    if not isinstance(target, discord.TextChannel):
+        got = getattr(target, "mention", "선택한 항목")
+        await interaction.response.send_message(
+            f"❌ {got}에는 패널을 올릴 수 없어요.\n"
+            f"**채널** 칸에는 일반 **텍스트 채널**을 골라주세요.\n"
+            f"비워두면 명령을 입력한 현재 채널에 게시됩니다.",
+            ephemeral=True,
+        )
+        return
+    guild = interaction.guild
+    assert guild is not None
+    if 카테고리 is not None and not isinstance(카테고리, discord.CategoryChannel):
+        await interaction.response.send_message(
+            "❌ **카테고리** 칸에는 카테고리만 골라주세요. (채널/음성 불가)",
+            ephemeral=True,
+        )
+        return
+    updates = {}
+    if 역할 is not None:
+        updates["staff"] = 역할.id
+    if 카테고리 is not None:
+        updates["category"] = 카테고리.id
+    if updates:
+        ticket.update_settings(guild.id, **updates)
+    try:
+        msg = await target.send(embed=ticket.build_panel(제목, 설명), view=ticket.PanelView())
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ 패널 게시 실패: {e}", ephemeral=True)
+        return
+    ticket.save_panel(msg.id, guild.id)
+    await interaction.response.send_message(
+        f"{target.mention}에 티켓 패널을 올렸어요. ✅\n{ticket.settings_summary(guild.id)}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="티켓설정", description="티켓 설정 확인/변경 (관리자)")
+@app_commands.describe(
+    역할="티켓 스태프 역할 (이 역할은 모든 티켓을 관리)",
+    카테고리="티켓이 생성될 카테고리",
+    해제="설정 비우기",
+    번호초기화="티켓 번호(카운터)를 0으로 되돌림",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_settings(
+    interaction: discord.Interaction,
+    역할: discord.Role | None = None,
+    카테고리: discord.abc.GuildChannel | None = None,
+    해제: Literal["안함", "스태프 역할", "카테고리", "역할+카테고리"] = "안함",
+    번호초기화: Literal["아니오", "예"] = "아니오",
+):
+    guild = interaction.guild
+    assert guild is not None
+    if 카테고리 is not None and not isinstance(카테고리, discord.CategoryChannel):
+        await interaction.response.send_message(
+            "❌ **카테고리** 칸에는 카테고리만 골라주세요.", ephemeral=True
+        )
+        return
+    fields: dict = {}
+    if 역할 is not None:
+        fields["staff"] = 역할.id
+    if 카테고리 is not None:
+        fields["category"] = 카테고리.id
+    if 해제 in ("스태프 역할", "역할+카테고리"):
+        fields["staff"] = None
+    if 해제 in ("카테고리", "역할+카테고리"):
+        fields["category"] = None
+    if 번호초기화 == "예":
+        fields["counter"] = 0
+    if fields:
+        ticket.update_settings(guild.id, **fields)
+    ticket.prune_missing(guild)
+    head = "✅ 설정을 바꿨어요.\n" if fields else "현재 티켓 설정이에요.\n"
+    await interaction.response.send_message(
+        head + ticket.settings_summary(guild.id), ephemeral=True
+    )
+
+
+@tree.command(name="티켓사유", description="티켓 열 때 사유 입력창 켜기/끄기 (관리자)")
+@app_commands.describe(상태="켜기 = [티켓 열기] 누르면 사유 입력 모달이 뜹니다")
+@app_commands.choices(
+    상태=[
+        app_commands.Choice(name="켜기", value="on"),
+        app_commands.Choice(name="끄기", value="off"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_reason(interaction: discord.Interaction, 상태: app_commands.Choice[str]):
+    guild = interaction.guild
+    assert guild is not None
+    on = 상태.value == "on"
+    ticket.update_settings(guild.id, reason=on)
+    await interaction.response.send_message(
+        f"✅ 사유 입력창을 **{'켜짐' if on else '꺼짐'}**으로 바꿨어요.\n"
+        f"현재 설정:\n{ticket.settings_summary(guild.id)}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="티켓닫기", description="현재 채널의 티켓을 닫습니다 (문의자/스태프)")
+@app_commands.describe(사유="남길 말 (선택, 티켓 기록에 남습니다)")
+async def ticket_close_cmd(interaction: discord.Interaction, 사유: str | None = None):
+    await ticket.close_ticket(interaction, note=(사유 or "").strip() or None)
 
 
 @tree.error
