@@ -102,15 +102,15 @@ Render 슬립 때문에 봇 명령어가 자주 죽는다면:
 | WEB_PUBLIC_URL | 사이트 공개 주소, 끝 `/` 없음 (웹인증 필수) |
 | WEB_SECRET | state 서명용 랜덤 문자열 (웹인증 필수) |
 | WEB_PORT | 웹 포트 (기본 8000, Render는 PORT 자동) |
-| ALLOWED_GUILDS | 웹인증 허용 서버ID + **슬래시명령 즉시반영 서버** (쉼표 구분, 비우면 GUILD_ID) |
+| ALLOWED_GUILDS | 웹인증 허용 서버ID (쉼표 구분, 비우면 GUILD_ID). 슬래시명령과는 무관 (전역 동기화) |
 | VERIFIED_ROLE_NAME | 기본 인증 롤 (패널에서 역할 미지정 시) |
 | UNVERIFIED_ROLE_NAME | 입장시 부여 미인증 롤 (비우면 끄기) |
 | AUTH_CHANNEL_ID / LOG_CHANNEL_ID | 환영멘션 / 입장로그 채널 (선택) |
 | MIN_ACCOUNT_AGE_DAYS | 최근생성계정 경고 기준일 (기본 7) |
-| GUILD_ID | ALLOWED_GUILDS가 없을 때의 기본 서버 (즉시반영 + 웹인증 허용) |
+| GUILD_ID | ALLOWED_GUILDS가 없을 때의 웹인증 기본 허용 서버 |
 
 ## 7. 트러블슈팅
 - "서버에 입장하지 않았습니다" → 유저가 서버에 먼저 들어와 있어야 역할 지급 가능
 - 이메일 미인증 실패 → 디스코드 설정 → 계정에서 이메일 인증 필요
 - 중복IP 실패 → 같은 접속기록으로 이미 다른 계정이 인증됨 (관리자가 DB 확인 후 판단)
-- 슬래시 명령 안 보임 → `ALLOWED_GUILDS`에 서버ID 넣으면 즉시 반영, 비우면 전역이라 최대 1시간
+- 슬래시 명령 안 보임 → 전역 동기화라 **최대 1시간** 걸림. 기다려도 안 뜨면 봇 재시작

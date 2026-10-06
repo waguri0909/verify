@@ -203,18 +203,6 @@ def link_view(url: str) -> discord.ui.View:
 
 
 # ---------- 이벤트 ----------
-def _sync_targets() -> list[int]:
-    """명령을 즉시 반영할 서버 목록. ALLOWED_GUILDS → GUILD_ID 순서로 읽음."""
-    raw = os.getenv("ALLOWED_GUILDS", "").strip() or os.getenv("GUILD_ID", "").strip()
-    out: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit() and int(part) not in out:
-            out.append(int(part))
-    # 이미 나간 서버는 제외 (403 동기화 오류 방지)
-    return [g for g in out if bot.get_guild(g) is not None]
-
-
 @bot.event
 async def on_ready():
     errors = config.validate()
@@ -224,29 +212,14 @@ async def on_ready():
         log.error("설정 오류: %s", errors)
     else:
         log.info("로그인: %s", bot.user)
-
-    # 1) 길드 단위 → 즉시 반영 (실패해도 이어서 전역 진행)
-    synced: list[int] = []
-    for gid in _sync_targets():
-        try:
-            obj = discord.Object(id=gid)
-            tree.copy_global_to(guild=obj)
-            await tree.sync(guild=obj)
-            synced.append(gid)
-        except Exception as e:
-            log.warning("길드 %s 명령 동기화 실패: %s", gid, e)
-    # 2) 전역 → 향후 새로 초대되는 서버용 (최대 1시간 반영)
+    # 전역(global) 동기화만 한다.
+    # 길드(서버) 단위 동기화를 함께 돌리면 같은 이름의 명령이 전역/길드 두 벌로
+    # 남아서 슬래시 메뉴에 2개씩 표시된다. 전역 하나면 어떤 서버에서든 자동으로 뜬다.
     try:
         await tree.sync()
+        log.info("슬래시 명령 동기화 완료 (전역, 최대 1시간 내 반영)")
     except Exception as e:
-        log.exception("전역 명령 동기화 실패: %s", e)
-        if synced:
-            log.info("슬래시 명령 동기화: 길드 %d개는 이미 반영됨", len(synced))
-        return
-    if synced:
-        log.info("슬래시 명령 동기화 완료 (길드 %d개 즉시 반영 + 전역)", len(synced))
-    else:
-        log.info("슬래시 명령 동기화 완료 (전역)")
+        log.exception("슬래시 명령 동기화 실패: %s", e)
 
 
 @bot.event
@@ -355,10 +328,13 @@ async def setup_panel(
             ephemeral=True,
         )
         return
+    # Discord 는 최초 응답에 3초만 준다. 그 안에 답 못하면
+    # 10062 Unknown interaction 으로 응답이 통째로 버려진다.
+    await interaction.response.defer(ephemeral=True)
     try:
         await webapi.api_ping()
     except webapi.ApiError as e:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ 웹 서버에 연결할 수 없습니다: {e}",
             ephemeral=True,
         )
@@ -381,7 +357,7 @@ async def setup_panel(
     }
     _save_json(PANEL_FILE, panels)
     desc = f"{target.mention}에 인증 패널을 올렸어요. ✅\n지급 역할: {verified.mention}"
-    await interaction.response.send_message(desc, ephemeral=True)
+    await interaction.followup.send(desc, ephemeral=True)
 
 
 @tree.command(name="복구키확인", description="이 서버의 복구키 확인/발급 (관리자 DM으로 전송)")
@@ -396,13 +372,14 @@ async def recover_key_check(interaction: discord.Interaction):
         f"• 테러 후 새 서버에서 `/복구 키:{key}` → 멤버 재초대, `/복구현황 키:{key}` → 인원 확인\n"
         f"⚠️ 절대 공유하지 마세요!"
     )
+    await interaction.response.defer(ephemeral=True)
     try:
         await interaction.user.send(text)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ 복구키를 DM으로 보냈어요.{' (새로 발급됨)' if is_new else ''}", ephemeral=True
         )
     except (discord.Forbidden, discord.HTTPException):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ DM이 막혀 있어 여기에 표시합니다. 확인 후 이 메시지를 지우세요.\n{text}",
             ephemeral=True,
         )
@@ -444,16 +421,16 @@ async def recover_run(interaction: discord.Interaction, 키: str):
             "❌ 봇에 **멤버 초대하기** 권한이 없습니다. 역할 설정을 확인해주세요.", ephemeral=True
         )
         return
+    await interaction.response.defer(ephemeral=True)
     total = 0
     try:
         total = await recover.backup_count(gid)
     except webapi.ApiError as e:
-        await interaction.response.send_message(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
         return
     if total == 0:
-        await interaction.response.send_message("❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True)
+        await interaction.followup.send("❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     msg = await interaction.followup.send(
         f"🔄 복구 시작: {total}명 (예상 약 {total * 1.5 / 60:.0f}분)…", ephemeral=True
     )
@@ -489,15 +466,16 @@ async def unverify(interaction: discord.Interaction, 유저: discord.Member):
     assert guild is not None
     verified = resolve_verified_role(guild)
     unverified = resolve_role(guild, config.unverified_role)
+    await interaction.response.defer(ephemeral=True)
     try:
         if verified and verified in 유저.roles:
             await 유저.remove_roles(verified, reason="관리자 인증 초기화")
         if unverified and unverified not in 유저.roles:
             await 유저.add_roles(unverified, reason="관리자 인증 초기화")
     except discord.Forbidden:
-        await interaction.response.send_message("❌ 권한 부족 (봇 롤 순서 확인)", ephemeral=True)
+        await interaction.followup.send("❌ 권한 부족 (봇 롤 순서 확인)", ephemeral=True)
         return
-    await interaction.response.send_message(f"{유저.mention} 인증을 해제했어요.", ephemeral=True)
+    await interaction.followup.send(f"{유저.mention} 인증을 해제했어요.", ephemeral=True)
     await send_log(guild, f"🔄 **인증해제** {유저.mention} (by {interaction.user.mention})")
 
 
@@ -535,15 +513,16 @@ async def set_verify_log(interaction: discord.Interaction, 웹훅: str):
 async def remove_verify_log(interaction: discord.Interaction):
     guild = interaction.guild
     assert guild is not None
+    await interaction.response.defer(ephemeral=True)
     try:
         removed = await webapi.webhook_remove(guild.id)
     except webapi.ApiError as e:
-        await interaction.response.send_message(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
         return
     if removed:
-        await interaction.response.send_message("✅ 인증 로그 웹훅을 해제했어요.", ephemeral=True)
+        await interaction.followup.send("✅ 인증 로그 웹훅을 해제했어요.", ephemeral=True)
     else:
-        await interaction.response.send_message("설정된 웹훅이 없어요.", ephemeral=True)
+        await interaction.followup.send("설정된 웹훅이 없어요.", ephemeral=True)
 
 
 # ---------- 슬래시 명령: 티켓 ----------
@@ -591,13 +570,14 @@ async def ticket_panel(
         updates["category"] = 카테고리.id
     if updates:
         ticket.update_settings(guild.id, **updates)
+    await interaction.response.defer(ephemeral=True)
     try:
         msg = await target.send(embed=ticket.build_panel(제목, 설명), view=ticket.PanelView())
     except discord.HTTPException as e:
-        await interaction.response.send_message(f"❌ 패널 게시 실패: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 패널 게시 실패: {e}", ephemeral=True)
         return
     ticket.save_panel(msg.id, guild.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"{target.mention}에 티켓 패널을 올렸어요. ✅\n{ticket.settings_summary(guild.id)}",
         ephemeral=True,
     )
