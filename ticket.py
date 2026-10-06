@@ -244,7 +244,6 @@ def build_panel(title: str | None = None, desc: str | None = None) -> discord.Em
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text="1인 1개 티켓 · 채널명에 번호가 표시됩니다")
     return embed
 
 
