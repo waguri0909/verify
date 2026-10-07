@@ -1,6 +1,6 @@
 """Discord 종합봇 (웹 OAuth 인증 + 티켓).
 
-인증: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
+인증: 패널 [인증하기] → Discord 승인 → 웹사이트에서
 이메일인증여부/중복IP 검사 → REST로 역할 지급.
 티켓: 패널 [결제·주문 문의] / [일반·파트너 문의] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
 로그: /입장로그 · /퇴장로그 → 각각 채널/켜기/이미지 독립 설정 (+ Pillow 전용 배너)
@@ -182,7 +182,7 @@ async def send_log(guild: discord.Guild, text: str):
 # ---------- 인증 패널 (웹 링크 버튼) ----------
 DEFAULT_TITLE = "🔐 멤버 인증"
 DEFAULT_LINE1 = "서버에 오신 걸 환영합니다!"
-DEFAULT_LINE2 = "아래 **웹에서 인증하기** 버튼을 눌러주세요.\n인증하면 나머지 채널이 보입니다."
+DEFAULT_LINE2 = "아래 **인증하기** 버튼을 눌러주세요.\n인증하면 나머지 채널이 보입니다."
 
 
 def build_panel(
@@ -280,7 +280,7 @@ async def on_member_join(member: discord.Member):
         if isinstance(ch, discord.TextChannel):
             try:
                 await ch.send(
-                    f"{member.mention}님 환영합니다! 위 **웹에서 인증하기** 버튼을 눌러주세요. 🎉",
+                    f"{member.mention}님 환영합니다! 위 **인증하기** 버튼을 눌러주세요. 🎉",
                     delete_after=30,
                 )
             except discord.HTTPException:
