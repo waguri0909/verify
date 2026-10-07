@@ -27,8 +27,6 @@ STORE = BASE_DIR / "tickets.json"
 OPEN_PURCHASE_BTN = "ticket:open:purchase"
 OPEN_GENERAL_BTN = "ticket:open:general"
 OPEN_BTN = "ticket:open"  # 예전 단일 버튼 패널 (LegacyPanelView) 에서만 사용
-
-TICKET_ADMIN_BTN = "ticket:admin"  # 패널의 [⚙️ 티켓 관리] 버튼
 CLOSE_BTN = "ticket:close"
 DELETE_BTN = "ticket:delete"
 REOPEN_BTN = "ticket:reopen"
@@ -457,21 +455,7 @@ class PanelView(discord.ui.View):
     async def open_general(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_open(interaction, GENERAL_KIND)
 
-    @discord.ui.button(
-        custom_id=TICKET_ADMIN_BTN,
-        label="⚙️ 티켓 관리",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def admin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if guild is None or not can_admin(interaction):
-            await interaction.response.send_message(
-                "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            embed=admin_embed(guild.id), view=TicketAdminView(), ephemeral=True
-        )
+    # 관리 버튼은 유저 패널에 붙이지 않는다 → /티켓패널 이 별도 메시지로 게시
 
 
 class LegacyPanelView(discord.ui.View):

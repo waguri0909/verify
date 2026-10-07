@@ -297,7 +297,8 @@ async def on_member_remove(member: discord.Member):
 # ---------- 슬래시 명령 ----------
 @tree.command(name="인증패널", description="인증 패널 게시 + 역할/문구 지정 (관리자)")
 @app_commands.describe(
-    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
+    채널="유저용 인증 패널을 올릴 텍스트 채널 (비우면 현재 채널)",
+    관리채널="관리자 버튼 패널을 올릴 채널 (비우면 유저 패널 옆에 별도 메시지로)",
     역할="인증하면 지급할 역할 (비우면 .env 기본값)",
     제목="패널 제목 (비우면 기본값)",
     문장1="맨 위 문장: 환영 문구 (비우면 기본값)",
@@ -307,6 +308,7 @@ async def on_member_remove(member: discord.Member):
 async def setup_panel(
     interaction: discord.Interaction,
     채널: discord.abc.GuildChannel | None = None,
+    관리채널: discord.abc.GuildChannel | None = None,
     역할: discord.Role | None = None,
     제목: str | None = None,
     문장1: str | None = None,
@@ -321,6 +323,16 @@ async def setup_panel(
             f"❌ {got}에는 패널을 올릴 수 없어요.\n"
             f"**채널** 칸에는 일반 **텍스트 채널**을 골라주세요. (음성/포럼/공지/카테고리·역할 불가)\n"
             f"비워두면 명령을 입력한 현재 채널에 게시됩니다.",
+            ephemeral=True,
+        )
+        return
+    # 유저 패널에는 [인증하기] 만 남기고, 관리자 버튼은 별도 메시지로 뺀다.
+    admin_target = 관리채널 or target
+    if isinstance(admin_target, discord.Thread):
+        admin_target = admin_target.parent
+    if not isinstance(admin_target, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ **관리채널** 칸에는 일반 **텍스트 채널**만 골라주세요.",
             ephemeral=True,
         )
         return
@@ -368,7 +380,14 @@ async def setup_panel(
         "line2": 문장2,
     }
     _save_json(PANEL_FILE, panels)
+    # 관리자 버튼은 유저 패널에 붙이지 않고 별도 메시지로 뺀다
+    await admin_target.send(embed=verify_admin_embed(guild), view=VerifyAdminView())
     desc = f"{target.mention}에 인증 패널을 올렸어요. ✅\n지급 역할: {verified.mention}"
+    desc += (
+        f"\n관리 패널: {admin_target.mention}"
+        if admin_target.id != target.id
+        else "\n관리 패널: 유저 패널 바로 아래 (같은 채널)"
+    )
     await interaction.followup.send(desc, ephemeral=True)
 
 
@@ -599,17 +618,44 @@ class RecoverConfirmView(discord.ui.View):
 
 
 class VerifyPanelView(discord.ui.View):
-    """인증 패널 = [인증하기] 링크 버튼 + 관리자 버튼 5개.
+    """유저용 인증 패널 — [인증하기] 링크 버튼 하나뿐.
 
-    링크 버튼은 패널마다 URL 이 다르므로 게시할 때 넣는다.
-    관리자 버튼 custom_id 고정 → bot.add_view 로 영구 유지.
+    관리자 버튼은 VerifyAdminView 로 떼어 별도 메시지(관리채널)에 게시해서
+    유저 패널을 깔끔하게 유지한다. 링크 URL 은 패널마다 다르므로 게시할 때 넣는다.
+    """
+
+    def __init__(self, url: str):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="인증하기", url=url))
+
+
+def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
+    verified = resolve_verified_role(guild)
+    unverified = resolve_role(guild, config.unverified_role)
+    embed = discord.Embed(
+        title="🛠️ 인증 관리",
+        description="인증 관리 버튼 (서버 관리자 전용)",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="지급 역할", value=verified.mention if verified else "미지정", inline=True
+    )
+    embed.add_field(
+        name="미인증 역할", value=unverified.mention if unverified else "미지정", inline=True
+    )
+    return embed
+
+
+class VerifyAdminView(discord.ui.View):
+    """인증 관리자 버튼 5개 — 유저 패널이 아니라 별도 메시지에만 게시된다.
+
+    custom_id 고정 → bot.add_view 로 영구 유지.
     권한 없는 사람이 눌러도 본인에게만 ephemeral 로 거절된다.
     """
 
-    def __init__(self, url: str | None = None):
+    def __init__(self):
         super().__init__(timeout=None)
-        if url:
-            self.add_item(discord.ui.Button(label="인증하기", url=url))
         specs = [
             ("verify:admin:reset", "🔄 인증 초기화",
              discord.ButtonStyle.secondary, self._reset, 1),
@@ -692,7 +738,7 @@ class VerifyPanelView(discord.ui.View):
 
 
 # 뷰 클래스가 아래에 정의돼서 위쪽 add_view 블록에 못 넣는다 → 여기서 등록
-bot.add_view(VerifyPanelView())
+bot.add_view(VerifyAdminView())
 bot.add_view(RecoverConfirmView())
 
 
@@ -701,7 +747,8 @@ bot.add_view(RecoverConfirmView())
 # ---------- 슬래시 명령: 티켓 ----------
 @tree.command(name="티켓패널", description="티켓 패널 게시 (버튼 → 전용 티켓 채널)")
 @app_commands.describe(
-    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
+    채널="유저용 티켓 패널을 올릴 텍스트 채널 (비우면 현재 채널)",
+    관리채널="관리 패널을 올릴 채널 (비우면 유저 패널 옆에 별도 메시지로)",
     제목="패널 제목 (비우면 기본값)",
     설명="패널 안내 문구 (비우면 기본값)",
     역할="티켓 스태프 역할 (지정하면 티켓 설정에도 저장)",
@@ -711,6 +758,7 @@ bot.add_view(RecoverConfirmView())
 async def ticket_panel(
     interaction: discord.Interaction,
     채널: discord.abc.GuildChannel | None = None,
+    관리채널: discord.abc.GuildChannel | None = None,
     제목: str | None = None,
     설명: str | None = None,
     역할: discord.Role | None = None,
@@ -725,6 +773,16 @@ async def ticket_panel(
             f"❌ {got}에는 패널을 올릴 수 없어요.\n"
             f"**채널** 칸에는 일반 **텍스트 채널**을 골라주세요.\n"
             f"비워두면 명령을 입력한 현재 채널에 게시됩니다.",
+            ephemeral=True,
+        )
+        return
+    # 유저 패널에는 유저 버튼 2개만, 관리 조작판은 별도 메시지로 뺀다.
+    admin_target = 관리채널 or target
+    if isinstance(admin_target, discord.Thread):
+        admin_target = admin_target.parent
+    if not isinstance(admin_target, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ **관리채널** 칸에는 일반 **텍스트 채널**만 골라주세요.",
             ephemeral=True,
         )
         return
@@ -750,14 +808,27 @@ async def ticket_panel(
         await interaction.followup.send(f"❌ 패널 게시 실패: {e}", ephemeral=True)
         return
     ticket.save_panel(msg.id, guild.id)
+    # 관리 조작판은 유저 패널에서 떨어뜨려 별도 메시지로 게시
+    note = (
+        f"\n관리 패널: {admin_target.mention}"
+        if admin_target.id != target.id
+        else "\n관리 패널: 유저 패널 바로 아래 (같은 채널)"
+    )
+    try:
+        await admin_target.send(
+            embed=ticket.admin_embed(guild.id), view=ticket.TicketAdminView()
+        )
+    except discord.HTTPException as e:
+        note = f"\n⚠️ 관리 패널 게시 실패: {e}"
     await interaction.followup.send(
-        f"{target.mention}에 티켓 패널을 올렸어요. ✅\n{ticket.settings_summary(guild.id)}",
+        f"{target.mention}에 티켓 패널을 올렸어요. ✅\n"
+        f"{ticket.settings_summary(guild.id)}{note}",
         ephemeral=True,
     )
 
 
 # 티켓설정 / 티켓사유 / 티켓닫기 명령은 제거 →
-#   설정·사유  : 티켓패널 [⚙️ 티켓 관리] 버튼 (ephemeral 조작판)
+#   설정·사유  : /티켓패널 게시한 관리 패널 (RoleSelect·ChannelSelect·버튼 직접 조작)
 #   티켓 닫기  : 티켓 채널 안의 [닫기 🔒] 버튼
 
 
