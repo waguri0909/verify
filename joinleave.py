@@ -401,3 +401,140 @@ async def preview(member: discord.Member, channel: discord.abc.Messageable, kind
         content="🖼️ **안내 이미지 미리보기**",
         file=discord.File(buf, filename=f"preview_{kind}.png"),
     )
+
+
+# ---------- 관리자 패널 (메시지 + 버튼) ----------
+def panel_embed(guild: discord.Guild, kind: str) -> discord.Embed:
+    s = settings(guild.id, kind)
+    label = LABEL[kind]
+    on = "🟢 켜짐" if s.get("enabled") else "🔴 꺼짐"
+    ch = f"<#{s['channel']}>" if s.get("channel") else "❌ 미지정"
+    img = "🖼️ 붙임" if s.get("image") else "🖼️ 안 붙임"
+
+    embed = discord.Embed(
+        title=f"{'📥' if kind == 'join' else '📤'} {label} 로그 패널",
+        description=f"{label} 로그 설정을 한곳에서 관리해요.",
+        color=EYE[kind][3],
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="로그 채널", value=ch, inline=True)
+    embed.add_field(name="상태", value=on, inline=True)
+    embed.add_field(name="안내 이미지", value=img, inline=True)
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text=f"{guild.name} · 입장/퇴장 로그는 각각 독립")
+    return embed
+
+
+class LogPanelView(discord.ui.View):
+    """입장/퇴장 로그 관리 패널.
+
+    custom_id 에 kind 가 들어가서 입장/퇴장이 완전히 분리된다.
+    custom_id 고정 + bot.add_view() 로 재시작 후에도 계속 눌린다.
+    버튼 라벨은 상태를 보여주므로 매번 새 View 로 다시 그린다.
+    """
+
+    def __init__(self, kind: str, guild_id: int | None = None):
+        super().__init__(timeout=None)
+        self.kind = kind
+        label = LABEL[kind]
+        if guild_id is None:  # 등록용 인스턴스 — custom_id 만 중요
+            enabled, image, has_ch = False, True, False
+        else:
+            s = settings(guild_id, kind)
+            enabled, image, has_ch = bool(s["enabled"]), bool(s["image"]), bool(s["channel"])
+
+        sel = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder=f"{label} 로그 보낼 채널",
+            min_values=1,
+            max_values=1,
+            custom_id=f"log:{kind}:channel",
+        )
+        sel.callback = self._on_channel
+        self.add_item(sel)
+
+        b_toggle = discord.ui.Button(
+            custom_id=f"log:{kind}:toggle",
+            label="🟢 켜짐" if enabled else "🔴 꺼짐",
+            style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger,
+            disabled=not has_ch,  # 채널이 없으면 켜도 소용없으니 잠금
+        )
+        b_toggle.callback = self._on_toggle
+        self.add_item(b_toggle)
+
+        b_image = discord.ui.Button(
+            custom_id=f"log:{kind}:image",
+            label="🖼️ 이미지 붙임" if image else "🖼️ 이미지 없음",
+            style=discord.ButtonStyle.primary if image else discord.ButtonStyle.secondary,
+        )
+        b_image.callback = self._on_image
+        self.add_item(b_image)
+
+        b_preview = discord.ui.Button(
+            custom_id=f"log:{kind}:preview",
+            label="👀 미리보기",
+            style=discord.ButtonStyle.secondary,
+        )
+        b_preview.callback = self._on_preview
+        self.add_item(b_preview)
+
+    # --- 공통 ---
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        await interaction.response.edit_message(
+            embed=panel_embed(guild, self.kind),
+            view=LogPanelView(self.kind, guild.id),
+        )
+
+    async def _fail(self, interaction: discord.Interaction, msg: str) -> None:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    # --- 콜백 ---
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        values = (interaction.data or {}).get("values") or []
+        if guild is None or not values:
+            await self._fail(interaction, "❌ 채널을 골라주세요.")
+            return
+        update(guild.id, self.kind, channel=int(values[0]), enabled=True)
+        await self._refresh(interaction)
+
+    async def _on_toggle(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        s = settings(guild.id, self.kind)
+        if not s["channel"]:
+            await self._fail(interaction, "❌ 먼저 아래에서 로그 채널을 골라주세요.")
+            return
+        update(guild.id, self.kind, enabled=not s["enabled"])
+        await self._refresh(interaction)
+
+    async def _on_image(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        s = settings(guild.id, self.kind)
+        update(guild.id, self.kind, image=not s["image"])
+        await self._refresh(interaction)
+
+    async def _on_preview(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        s = settings(guild.id, self.kind)
+        dest = guild.get_channel(int(s["channel"])) if s.get("channel") else None
+        if not isinstance(dest, discord.TextChannel):
+            dest = interaction.channel
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await preview(interaction.user, dest, self.kind)
+            await interaction.followup.send(
+                f"👀 {LABEL[self.kind]} 배너 미리보기를 보냈어요.", ephemeral=True
+            )
+        except Exception as e:
+            log.warning("미리보기 실패: %s", e)
+            await interaction.followup.send(f"❌ 미리보기 실패: {e}", ephemeral=True)

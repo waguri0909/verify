@@ -16,10 +16,11 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 from urllib.parse import quote as url_quote
 
 import discord
@@ -83,6 +84,11 @@ bot.add_view(ticket.PanelView())
 bot.add_view(ticket.LegacyPanelView())  # 버튼 1개짜리 구(舊) 패널이 계속 눌리도록
 bot.add_view(ticket.TicketView())
 bot.add_view(ticket.ClosedTicketView())
+bot.add_view(ticket.TicketAdminView())  # 패널 [⚙️ 티켓 관리] → ephemeral 조작판
+
+# 입장/퇴장 로그 관리 패널 (custom_id 에 kind 가 들어가 분리됨)
+bot.add_view(joinleave.LogPanelView("join"))
+bot.add_view(joinleave.LogPanelView("leave"))
 
 
 def _guild_name(gid: int) -> str | None:
@@ -197,12 +203,6 @@ def build_panel(
     )
     embed.set_footer(text="문의: 서버 관리자")
     return embed
-
-
-def link_view(url: str) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="인증하기", url=url))
-    return view
 
 
 # ---------- 이벤트 ----------
@@ -358,7 +358,7 @@ async def setup_panel(
     iparam = f"&i={guild.icon.key}" if guild.icon else ""
     url = f"{base}/?guild={guild.id}&role={verified.id}{gparam}{iparam}"
     embed = build_panel(verified, 제목, 문장1, 문장2)
-    msg = await target.send(embed=embed, view=link_view(url))
+    msg = await target.send(embed=embed, view=VerifyPanelView(url))
     panels = _load_json(PANEL_FILE)
     panels[str(msg.id)] = {
         "guild": guild.id,
@@ -372,169 +372,330 @@ async def setup_panel(
     await interaction.followup.send(desc, ephemeral=True)
 
 
-@tree.command(name="복구키확인", description="이 서버의 복구키 확인/발급 (관리자 DM으로 전송)")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def recover_key_check(interaction: discord.Interaction):
-    guild = interaction.guild
-    assert guild is not None
-    key, is_new = recover.ensure_key(guild.id, interaction.user.id)
-    text = (
-        f"🔑 **{guild.name} 서버의 복구키**\n`{key}`\n\n"
-        f"• 이 서버에서 웹 인증하는 사람이 이 키 앞으로 자동 누적됩니다.\n"
-        f"• 테러 후 새 서버에서 `/복구 키:{key}` → 멤버 재초대, `/복구현황 키:{key}` → 인원 확인\n"
-        f"⚠️ 절대 공유하지 마세요!"
+# ---------- 인증 관리 (인증패널의 버튼 → 모달 / ephemeral) ----------
+# 슬래시명령 복구키확인·복구현황·복구·인증초기화·인증로그·인증로그해제 를
+# 여기 버튼으로 옮겨왔다. 권한은 관리자(서버관리 또는 역할관리).
+
+_PENDING_RECOVER: dict[int, str] = {}  # 유저 id -> 복구키 (실행 확인용)
+
+
+def _verify_admin_ok(interaction: discord.Interaction) -> bool:
+    user = interaction.user
+    if not isinstance(user, discord.Member):
+        return False
+    p = user.guild_permissions
+    return bool(p.manage_guild or p.manage_roles)
+
+
+async def _deny(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
     )
-    await interaction.response.defer(ephemeral=True)
+
+
+async def _resolve_member(guild: discord.Guild, raw: str) -> discord.Member | None:
+    """멘션/ID 어느 쪽이든 숫자만 뽑아 멤버를 찾는다."""
+    m = re.search(r"\d{15,25}", raw or "")
+    if not m:
+        return None
+    uid = int(m.group(0))
+    member = guild.get_member(uid)
+    if member is not None:
+        return member
     try:
-        await interaction.user.send(text)
+        return await guild.fetch_member(uid)
+    except discord.HTTPException:
+        return None
+
+
+class UnverifyModal(discord.ui.Modal, title="인증 초기화"):
+    target = discord.ui.TextInput(
+        label="해제할 유저", placeholder="멘션 또는 숫자 ID", required=True, max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        member = await _resolve_member(guild, str(self.target.value))
+        if member is None:
+            await interaction.response.send_message(
+                "❌ 유저를 찾을 수 없어요. 멘션 또는 숫자 ID로 입력해주세요.", ephemeral=True
+            )
+            return
+        verified = resolve_verified_role(guild)
+        unverified = resolve_role(guild, config.unverified_role)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if verified and verified in member.roles:
+                await member.remove_roles(verified, reason="관리자 인증 초기화")
+            if unverified and unverified not in member.roles:
+                await member.add_roles(unverified, reason="관리자 인증 초기화")
+        except discord.Forbidden:
+            await interaction.followup.send("❌ 권한 부족 (봇 롤 순서 확인)", ephemeral=True)
+            return
         await interaction.followup.send(
-            f"✅ 복구키를 DM으로 보냈어요.{' (새로 발급됨)' if is_new else ''}", ephemeral=True
+            f"{member.mention} 인증을 해제했어요.", ephemeral=True
         )
-    except (discord.Forbidden, discord.HTTPException):
+        await send_log(
+            guild, f"🔄 **인증해제** {member.mention} (by {interaction.user.mention})"
+        )
+
+
+class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
+    url = discord.ui.TextInput(
+        label="웹훅 URL", placeholder="https://discord.com/api/webhooks/...",
+        required=True, max_length=300,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            ok, detail = await webapi.webhook_test(guild.id, str(self.url.value).strip())
+        except webapi.ApiError as e:
+            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+            return
+        if not ok:
+            hint = ""
+            if "404" in detail:
+                hint = ("\n💡 404 = 웹훅이 삭제됐거나 URL 오타. "
+                        "채널 설정 → 연동 → 웹훅에서 URL을 다시 복사해주세요.")
+            elif "401" in detail or "403" in detail:
+                hint = "\n💡 401/403 = 토큰이 유효하지 않음. 웹훅을 새로 만드세요."
+            elif "형식" in detail:
+                hint = "\n💡 `https://discord.com/api/webhooks/...` 형태여야 해요."
+            await interaction.followup.send(
+                f"❌ 웹훅 전송 테스트 실패.\n상세: `{detail}`{hint}", ephemeral=True
+            )
+            return
         await interaction.followup.send(
-            f"⚠️ DM이 막혀 있어 여기에 표시합니다. 확인 후 이 메시지를 지우세요.\n{text}",
+            "✅ 인증 로그 웹훅이 설정됐어요. 테스트 메시지를 보냈으니 확인해보세요.",
             ephemeral=True,
         )
 
 
-@tree.command(name="복구현황", description="복구키에 쌓인 인원 확인 (관리자)")
-@app_commands.describe(키="봇 초대 시 DM으로 받은 복구키")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def recover_status(interaction: discord.Interaction, 키: str):
-    gid = recover.key_to_guild(키)
-    if gid is None:
-        await interaction.response.send_message("❌ 유효하지 않은 복구키입니다.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        n = await recover.backup_count(gid)
-    except webapi.ApiError as e:
-        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
-        return
-    await interaction.followup.send(
-        f"🔑 이 복구키에 **{n}명** 쌓여 있습니다.\n(웹 인증 + 참가 승인을 한 사람만 복구 가능)",
-        ephemeral=True,
+class RecoverModal(discord.ui.Modal, title="복구"):
+    key = discord.ui.TextInput(
+        label="복구키", placeholder="XXXX-XXXX-XXXX", required=True, max_length=64,
     )
 
-
-@tree.command(name="복구", description="복구키로 백업된 멤버들을 이 서버에 초대 (관리자)")
-@app_commands.describe(키="봇 초대 시 DM으로 받은 복구키")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def recover_run(interaction: discord.Interaction, 키: str):
-    guild = interaction.guild
-    assert guild is not None
-    gid = recover.key_to_guild(키)
-    if gid is None:
-        await interaction.response.send_message("❌ 유효하지 않은 복구키입니다.", ephemeral=True)
-        return
-    me = guild.me
-    if me is None or not me.guild_permissions.create_instant_invite:
-        await interaction.response.send_message(
-            "❌ 봇에 **멤버 초대하기** 권한이 없습니다. 역할 설정을 확인해주세요.", ephemeral=True
-        )
-        return
-    await interaction.response.defer(ephemeral=True)
-    total = 0
-    try:
-        total = await recover.backup_count(gid)
-    except webapi.ApiError as e:
-        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
-        return
-    if total == 0:
-        await interaction.followup.send("❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True)
-        return
-    msg = await interaction.followup.send(
-        f"🔄 복구 시작: {total}명 (예상 약 {total * 1.5 / 60:.0f}분)…", ephemeral=True
-    )
-    last_edit = 0.0
-    import time as _time
-
-    async def progress(done: int, total_n: int):
-        nonlocal last_edit
-        if done == total_n or done % 10 == 0 or _time.time() - last_edit > 10:
-            last_edit = _time.time()
-            try:
-                await msg.edit(content=f"🔄 복구 중… {done}/{total_n}")
-            except discord.HTTPException:
-                pass
-
-    res = await recover.run_restore(guild.id, gid, progress)
-    summary = (
-        f"✅ 복구 완료: {total}명 중\n"
-        f"- 새로 초대: {res['ok']}명\n"
-        f"- 이미 있음: {res['already']}명\n"
-        f"- 토큰 만료/취소: {res['dead']}명 (재인증 필요)\n"
-        f"- 실패: {res['fail']}명"
-    )
-    await msg.edit(content=summary)
-    await send_log(guild, f"🔑 **복구 실행** (by {interaction.user.mention})\n{summary}")
-
-
-@tree.command(name="인증초기화", description="유저 인증 해제 (관리자)")
-@app_commands.describe(유저="해제할 유저")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def unverify(interaction: discord.Interaction, 유저: discord.Member):
-    guild = interaction.guild
-    assert guild is not None
-    verified = resolve_verified_role(guild)
-    unverified = resolve_role(guild, config.unverified_role)
-    await interaction.response.defer(ephemeral=True)
-    try:
-        if verified and verified in 유저.roles:
-            await 유저.remove_roles(verified, reason="관리자 인증 초기화")
-        if unverified and unverified not in 유저.roles:
-            await 유저.add_roles(unverified, reason="관리자 인증 초기화")
-    except discord.Forbidden:
-        await interaction.followup.send("❌ 권한 부족 (봇 롤 순서 확인)", ephemeral=True)
-        return
-    await interaction.followup.send(f"{유저.mention} 인증을 해제했어요.", ephemeral=True)
-    await send_log(guild, f"🔄 **인증해제** {유저.mention} (by {interaction.user.mention})")
-
-
-@tree.command(name="인증로그", description="인증 성공 시 전송될 웹훅 설정 (관리자)")
-@app_commands.describe(웹훅="채널 설정 → 연동 → 웹훅 → 새 웹훅 → URL 복사")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def set_verify_log(interaction: discord.Interaction, 웹훅: str):
-    guild = interaction.guild
-    assert guild is not None
-    url = 웹훅.strip()
-    await interaction.response.defer(ephemeral=True)
-    try:
-        ok, detail = await webapi.webhook_test(guild.id, url)
-    except webapi.ApiError as e:
-        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
-        return
-    if not ok:
-        hint = ""
-        if "404" in detail:
-            hint = "\n💡 404 = 웹훅이 삭제됐거나 URL 오타. 채널 설정 → 연동 → 웹훅에서 URL을 다시 복사해주세요."
-        elif "401" in detail or "403" in detail:
-            hint = "\n💡 401/403 = 토큰이 유효하지 않음. 웹훅을 새로 만드세요."
-        elif "형식" in detail:
-            hint = "\n💡 `https://discord.com/api/webhooks/...` 형태여야 해요."
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        key = str(self.key.value).strip()
+        gid = recover.key_to_guild(key)
+        if gid is None:
+            await interaction.response.send_message(
+                "❌ 유효하지 않은 복구키입니다.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            n = await recover.backup_count(gid)
+        except webapi.ApiError as e:
+            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+            return
+        if n == 0:
+            await interaction.followup.send(
+                "❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True
+            )
+            return
+        _PENDING_RECOVER[interaction.user.id] = key
         await interaction.followup.send(
-            f"❌ 웹훅 전송 테스트 실패.\n상세: `{detail}`{hint}",
+            f"🔑 이 복구키에 **{n}명** 쌓여 있습니다.\n"
+            f"지금 이 서버로 복구할까요? (예상 약 {n * 1.5 / 60:.0f}분)",
+            view=RecoverConfirmView(),
             ephemeral=True,
         )
-        return
-    await interaction.followup.send("✅ 인증 로그 웹훅이 설정됐어요. 테스트 메시지를 보냈으니 확인해보세요.", ephemeral=True)
 
 
-@tree.command(name="인증로그해제", description="인증 웹훅 해제 (관리자)")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def remove_verify_log(interaction: discord.Interaction):
-    guild = interaction.guild
-    assert guild is not None
-    await interaction.response.defer(ephemeral=True)
-    try:
-        removed = await webapi.webhook_remove(guild.id)
-    except webapi.ApiError as e:
-        await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
-        return
-    if removed:
-        await interaction.followup.send("✅ 인증 로그 웹훅을 해제했어요.", ephemeral=True)
-    else:
-        await interaction.followup.send("설정된 웹훅이 없어요.", ephemeral=True)
+class RecoverConfirmView(discord.ui.View):
+    """복구 실행 확인 버튼. 복구키는 _PENDING_RECOVER 에 유저별로 들어있다."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        b = discord.ui.Button(
+            custom_id="verify:recover:go",
+            label="▶️ 바로 실행",
+            style=discord.ButtonStyle.green,
+        )
+        b.callback = self._on_go
+        self.add_item(b)
+
+    async def _on_go(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        key = _PENDING_RECOVER.get(interaction.user.id)
+        if guild is None:
+            return
+        if key is None:
+            await interaction.response.send_message(
+                "❌ 복구키가 초기화됐어요. [♻️ 복구 실행] 을 다시 눌러주세요.", ephemeral=True
+            )
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        gid = recover.key_to_guild(key)
+        if gid is None:
+            await interaction.response.send_message(
+                "❌ 유효하지 않은 복구키입니다.", ephemeral=True
+            )
+            return
+        me = guild.me
+        if me is None or not me.guild_permissions.create_instant_invite:
+            await interaction.response.send_message(
+                "❌ 봇에 **멤버 초대하기** 권한이 없습니다. 역할 설정을 확인해주세요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            total = await recover.backup_count(gid)
+        except webapi.ApiError as e:
+            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+            return
+        if total == 0:
+            await interaction.followup.send(
+                "❌ 이 복구키에 쌓인 인원이 없습니다.", ephemeral=True
+            )
+            return
+        msg = await interaction.followup.send(
+            f"🔄 복구 시작: {total}명 (예상 약 {total * 1.5 / 60:.0f}분)…", ephemeral=True
+        )
+        last_edit = 0.0
+
+        async def progress(done: int, total_n: int) -> None:
+            nonlocal last_edit
+            if done == total_n or done % 10 == 0 or time.time() - last_edit > 10:
+                last_edit = time.time()
+                try:
+                    await msg.edit(content=f"🔄 복구 중… {done}/{total_n}")
+                except discord.HTTPException:
+                    pass
+
+        res = await recover.run_restore(guild.id, gid, progress)
+        summary = (
+            f"✅ 복구 완료: {total}명 중\n"
+            f"- 새로 초대: {res['ok']}명\n"
+            f"- 이미 있음: {res['already']}명\n"
+            f"- 토큰 만료/취소: {res['dead']}명 (재인증 필요)\n"
+            f"- 실패: {res['fail']}명"
+        )
+        await msg.edit(content=summary)
+        await send_log(guild, f"🔑 **복구 실행** (by {interaction.user.mention})\n{summary}")
+
+
+class VerifyPanelView(discord.ui.View):
+    """인증 패널 = [인증하기] 링크 버튼 + 관리자 버튼 5개.
+
+    링크 버튼은 패널마다 URL 이 다르므로 게시할 때 넣는다.
+    관리자 버튼 custom_id 고정 → bot.add_view 로 영구 유지.
+    권한 없는 사람이 눌러도 본인에게만 ephemeral 로 거절된다.
+    """
+
+    def __init__(self, url: str | None = None):
+        super().__init__(timeout=None)
+        if url:
+            self.add_item(discord.ui.Button(label="인증하기", url=url))
+        specs = [
+            ("verify:admin:reset", "🔄 인증 초기화",
+             discord.ButtonStyle.secondary, self._reset, 1),
+            ("verify:webhook:set", "📜 웹훅 등록",
+             discord.ButtonStyle.secondary, self._webhook_set, 1),
+            ("verify:webhook:clear", "🗑 웹훅 해제",
+             discord.ButtonStyle.red, self._webhook_clear, 1),
+            ("verify:recover:key", "🔑 복구키 확인",
+             discord.ButtonStyle.secondary, self._recover_key, 2),
+            ("verify:recover:run", "♻️ 복구 실행",
+             discord.ButtonStyle.green, self._recover_run, 2),
+        ]
+        for cid, label, style, cb, row in specs:
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=row)
+            b.callback = cb
+            self.add_item(b)
+
+    async def _reset(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(UnverifyModal())
+
+    async def _webhook_set(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(WebhookModal())
+
+    async def _webhook_clear(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            removed = await webapi.webhook_remove(guild.id)
+        except webapi.ApiError as e:
+            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "✅ 인증 로그 웹훅을 해제했어요." if removed else "설정된 웹훅이 없어요.",
+            ephemeral=True,
+        )
+
+    async def _recover_key(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        key, is_new = recover.ensure_key(guild.id, interaction.user.id)
+        text = (
+            f"🔑 **{guild.name} 서버의 복구키**\n`{key}`\n\n"
+            f"• 이 서버에서 웹 인증하는 사람이 이 키 앞으로 자동 누적됩니다.\n"
+            f"• 테러 후 새 서버에서 [♻️ 복구 실행] → 멤버 재초대\n"
+            f"⚠️ 절대 공유하지 마세요!"
+        )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.user.send(text)
+            await interaction.followup.send(
+                f"✅ 복구키를 DM으로 보냈어요.{' (새로 발급됨)' if is_new else ''}",
+                ephemeral=True,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.followup.send(
+                f"⚠️ DM이 막혀 있어 여기에 표시합니다. 확인 후 이 메시지를 지우세요.\n{text}",
+                ephemeral=True,
+            )
+
+    async def _recover_run(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(RecoverModal())
+
+
+# 뷰 클래스가 아래에 정의돼서 위쪽 add_view 블록에 못 넣는다 → 여기서 등록
+bot.add_view(VerifyPanelView())
+bot.add_view(RecoverConfirmView())
+
+
 
 
 # ---------- 슬래시 명령: 티켓 ----------
@@ -595,179 +756,77 @@ async def ticket_panel(
     )
 
 
-@tree.command(name="티켓설정", description="티켓 설정 확인/변경 (관리자)")
-@app_commands.describe(
-    역할="티켓 스태프 역할 (이 역할은 모든 티켓을 관리)",
-    카테고리="티켓이 생성될 카테고리",
-    해제="설정 비우기",
-    번호초기화="티켓 번호(카운터)를 0으로 되돌림",
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ticket_settings(
+# 티켓설정 / 티켓사유 / 티켓닫기 명령은 제거 →
+#   설정·사유  : 티켓패널 [⚙️ 티켓 관리] 버튼 (ephemeral 조작판)
+#   티켓 닫기  : 티켓 채널 안의 [닫기 🔒] 버튼
+
+
+async def _post_log_panel(
     interaction: discord.Interaction,
-    역할: discord.Role | None = None,
-    카테고리: discord.abc.GuildChannel | None = None,
-    해제: Literal["안함", "스태프 역할", "카테고리", "역할+카테고리"] = "안함",
-    번호초기화: Literal["아니오", "예"] = "아니오",
+    kind: str,
+    채널: discord.abc.GuildChannel | None,
+    로그채널: discord.abc.GuildChannel | None,
 ):
+    """입장/퇴장 로그 관리 패널 게시 — 두 명령이 이걸 공유한다."""
     guild = interaction.guild
     assert guild is not None
-    if 카테고리 is not None and not isinstance(카테고리, discord.CategoryChannel):
+    label = joinleave.LABEL[kind]
+
+    if 로그채널 is not None:
+        target = 로그채널.parent if isinstance(로그채널, discord.Thread) else 로그채널
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ **로그채널** 칸에는 일반 텍스트 채널만 골라주세요.", ephemeral=True
+            )
+            return
+        joinleave.update(guild.id, kind, channel=target.id, enabled=True)
+
+    dest = 채널 or interaction.channel
+    if isinstance(dest, discord.Thread):
+        dest = dest.parent
+    if not isinstance(dest, discord.TextChannel):
         await interaction.response.send_message(
-            "❌ **카테고리** 칸에는 카테고리만 골라주세요.", ephemeral=True
+            "❌ **채널** 칸에는 일반 텍스트 채널만 골라주세요.", ephemeral=True
         )
         return
-    fields: dict = {}
-    if 역할 is not None:
-        fields["staff"] = 역할.id
-    if 카테고리 is not None:
-        fields["category"] = 카테고리.id
-    if 해제 in ("스태프 역할", "역할+카테고리"):
-        fields["staff"] = None
-    if 해제 in ("카테고리", "역할+카테고리"):
-        fields["category"] = None
-    if 번호초기화 == "예":
-        fields["counter"] = 0
-    if fields:
-        ticket.update_settings(guild.id, **fields)
-    ticket.prune_missing(guild)
-    head = "✅ 설정을 바꿨어요.\n" if fields else "현재 티켓 설정이에요.\n"
-    await interaction.response.send_message(
-        head + ticket.settings_summary(guild.id), ephemeral=True
+
+    await dest.send(
+        embed=joinleave.panel_embed(guild, kind),
+        view=joinleave.LogPanelView(kind, guild.id),
     )
-
-
-@tree.command(name="티켓사유", description="티켓 열 때 사유 입력창 켜기/끄기 (관리자)")
-@app_commands.describe(상태="켜기 = 패널 버튼을 누르면 사유 입력 모달이 뜹니다")
-@app_commands.choices(
-    상태=[
-        app_commands.Choice(name="켜기", value="on"),
-        app_commands.Choice(name="끄기", value="off"),
-    ]
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ticket_reason(interaction: discord.Interaction, 상태: app_commands.Choice[str]):
-    guild = interaction.guild
-    assert guild is not None
-    on = 상태.value == "on"
-    ticket.update_settings(guild.id, reason=on)
     await interaction.response.send_message(
-        f"✅ 사유 입력창을 **{'켜짐' if on else '꺼짐'}**으로 바꿨어요.\n"
-        f"현재 설정:\n{ticket.settings_summary(guild.id)}",
+        f"✅ **{label} 로그 패널**을 {dest.mention}에 게시했어요.\n"
+        f"채널·켜기/끄기·이미지는 패널 버튼으로 바꿀 수 있어요.",
         ephemeral=True,
     )
 
 
-@tree.command(name="티켓닫기", description="현재 채널의 티켓을 닫습니다 (문의자/스태프)")
-@app_commands.describe(사유="남길 말 (선택, 티켓 기록에 남습니다)")
-async def ticket_close_cmd(interaction: discord.Interaction, 사유: str | None = None):
-    await ticket.close_ticket(interaction, note=(사유 or "").strip() or None)
-
-
-async def _log_command(
-    interaction: discord.Interaction,
-    kind: str,
-    채널: discord.abc.GuildChannel | None,
-    상태: app_commands.Choice[str] | None,
-    이미지: app_commands.Choice[str] | None,
-    미리보기: bool,
-):
-    """입장/퇴장 로그 공용 처리 — 설정은 서로 완전히 독립이다."""
-    guild = interaction.guild
-    assert guild is not None
-    label = joinleave.LABEL[kind]
-    fields: dict = {}
-    if 채널 is not None:
-        target = 채널.parent if isinstance(채널, discord.Thread) else 채널
-        if not isinstance(target, discord.TextChannel):
-            await interaction.response.send_message(
-                "❌ **채널** 칸에는 일반 텍스트 채널만 골라주세요.", ephemeral=True
-            )
-            return
-        fields["channel"] = target.id
-        fields["enabled"] = True  # 채널을 지정하면 자연스럽게 켜지는 게 직관적
-    if 상태 is not None:
-        fields["enabled"] = 상태.value == "on"
-    if 이미지 is not None:
-        fields["image"] = 이미지.value == "on"
-    if fields:
-        joinleave.update(guild.id, kind, **fields)
-        head = f"✅ {label} 로그 설정을 바꿨어요.\n"
-    else:
-        head = f"현재 {label} 로그 설정이에요.\n"
-    body = head + joinleave.summary(guild.id, kind)
-
-    if 미리보기:
-        await interaction.response.defer(ephemeral=True)
-        s = joinleave.settings(guild.id, kind)
-        dest = guild.get_channel(int(s["channel"])) if s.get("channel") else None
-        if not isinstance(dest, discord.TextChannel):
-            dest = interaction.channel
-        try:
-            await joinleave.preview(interaction.user, dest, kind)
-            await interaction.followup.send(body, ephemeral=True)
-        except Exception as e:
-            log.warning("미리보기 실패: %s", e)
-            await interaction.followup.send(f"❌ 미리보기 실패: {e}", ephemeral=True)
-        return
-
-    await interaction.response.send_message(body, ephemeral=True)
-
-
-@tree.command(name="입장로그", description="입장 로그 설정 (관리자)")
+@tree.command(name="입장로그패널", description="입장 로그 관리 패널 게시 (관리자)")
 @app_commands.describe(
-    채널="입장 로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
-    상태="입장 로그 켜기/끄기",
-    이미지="안내 이미지 붙이기/빼기",
-    미리보기="안내 이미지를 미리 보여줍니다",
-)
-@app_commands.choices(
-    상태=[
-        app_commands.Choice(name="켜기", value="on"),
-        app_commands.Choice(name="끄기", value="off"),
-    ],
-    이미지=[
-        app_commands.Choice(name="붙이기", value="on"),
-        app_commands.Choice(name="빼기", value="off"),
-    ],
+    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
+    로그채널="입장 로그를 보낼 채널 (지정하면 바로 설정+켜기)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
-async def join_log_command(
+async def join_log_panel(
     interaction: discord.Interaction,
     채널: discord.abc.GuildChannel | None = None,
-    상태: app_commands.Choice[str] | None = None,
-    이미지: app_commands.Choice[str] | None = None,
-    미리보기: bool = False,
+    로그채널: discord.abc.GuildChannel | None = None,
 ):
-    await _log_command(interaction, "join", 채널, 상태, 이미지, 미리보기)
+    await _post_log_panel(interaction, "join", 채널, 로그채널)
 
 
-@tree.command(name="퇴장로그", description="퇴장 로그 설정 (관리자)")
+@tree.command(name="퇴장로그패널", description="퇴장 로그 관리 패널 게시 (관리자)")
 @app_commands.describe(
-    채널="퇴장 로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
-    상태="퇴장 로그 켜기/끄기",
-    이미지="안내 이미지 붙이기/빼기",
-    미리보기="안내 이미지를 미리 보여줍니다",
-)
-@app_commands.choices(
-    상태=[
-        app_commands.Choice(name="켜기", value="on"),
-        app_commands.Choice(name="끄기", value="off"),
-    ],
-    이미지=[
-        app_commands.Choice(name="붙이기", value="on"),
-        app_commands.Choice(name="빼기", value="off"),
-    ],
+    채널="패널 올릴 텍스트 채널 (비우면 현재 채널)",
+    로그채널="퇴장 로그를 보낼 채널 (지정하면 바로 설정+켜기)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
-async def leave_log_command(
+async def leave_log_panel(
     interaction: discord.Interaction,
     채널: discord.abc.GuildChannel | None = None,
-    상태: app_commands.Choice[str] | None = None,
-    이미지: app_commands.Choice[str] | None = None,
-    미리보기: bool = False,
+    로그채널: discord.abc.GuildChannel | None = None,
 ):
-    await _log_command(interaction, "leave", 채널, 상태, 이미지, 미리보기)
+    await _post_log_panel(interaction, "leave", 채널, 로그채널)
 
 
 @tree.error

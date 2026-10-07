@@ -27,6 +27,8 @@ STORE = BASE_DIR / "tickets.json"
 OPEN_PURCHASE_BTN = "ticket:open:purchase"
 OPEN_GENERAL_BTN = "ticket:open:general"
 OPEN_BTN = "ticket:open"  # 예전 단일 버튼 패널 (LegacyPanelView) 에서만 사용
+
+TICKET_ADMIN_BTN = "ticket:admin"  # 패널의 [⚙️ 티켓 관리] 버튼
 CLOSE_BTN = "ticket:close"
 DELETE_BTN = "ticket:delete"
 REOPEN_BTN = "ticket:reopen"
@@ -255,6 +257,121 @@ def build_panel(title: str | None = None, desc: str | None = None) -> discord.Em
     return embed
 
 
+# ---------- 티켓 관리 (패널의 [⚙️ 티켓 관리] 버튼 → ephemeral 조작판) ----------
+def can_admin(interaction: discord.Interaction) -> bool:
+    """패널 관리 버튼 권한 — 슬래시명령 era 와 동일하게 서버관리 기준."""
+    user = interaction.user
+    if not isinstance(user, discord.Member):
+        return False
+    return bool(user.guild_permissions.manage_guild)
+
+
+def admin_embed(guild_id: int) -> discord.Embed:
+    s = guild_settings(guild_id)
+    staff = f"<@&{s['staff']}>" if s.get("staff") else "미지정 (봇 권한으로 판단)"
+    cat = f"<#{s['category']}>" if s.get("category") else "미지정 (최상위 카테고리)"
+    reason = "🟢 켜짐" if s.get("reason", True) else "🔴 꺼짐"
+    embed = discord.Embed(
+        title="⚙️ 티켓 관리",
+        description="아래에서 티켓 설정을 바로바로 바꿀 수 있어요.",
+        color=discord.Color.from_rgb(99, 102, 241),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="스태프 역할", value=staff, inline=True)
+    embed.add_field(name="티켓 카테고리", value=cat, inline=True)
+    embed.add_field(name="사유 입력창", value=reason, inline=True)
+    embed.add_field(name="발급된 티켓", value=f"{int(s.get('counter', 0))}개", inline=True)
+    embed.add_field(name="게시된 패널", value=f"{panel_count(guild_id)}개", inline=True)
+    return embed
+
+
+class TicketAdminView(discord.ui.View):
+    """티켓 설정 조작판. ephemeral 메시지에 뜨고 바꿀 때마다 즉시 다시 그려진다."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        role_sel = discord.ui.RoleSelect(
+            custom_id="ticket:admin:role",
+            placeholder="티켓 스태프 역할 지정",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        role_sel.callback = self._on_role
+        self.add_item(role_sel)
+
+        cat_sel = discord.ui.ChannelSelect(
+            custom_id="ticket:admin:category",
+            channel_types=[discord.ChannelType.category],
+            placeholder="티켓이 생성될 카테고리 지정",
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+        cat_sel.callback = self._on_category
+        self.add_item(cat_sel)
+
+        for cid, label, style, cb in (
+            ("ticket:admin:reason_on", "사유 입력창 켜기",
+             discord.ButtonStyle.green, self._on_reason_on),
+            ("ticket:admin:reason_off", "사유 입력창 끄기",
+             discord.ButtonStyle.red, self._on_reason_off),
+        ):
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=2)
+            b.callback = cb
+            self.add_item(b)
+
+        for cid, label, cb in (
+            ("ticket:admin:clear", "역할·카테고리 해제", self._on_clear),
+            ("ticket:admin:reset", "번호 초기화", self._on_reset),
+        ):
+            b = discord.ui.Button(
+                custom_id=cid, label=label,
+                style=discord.ButtonStyle.secondary, row=3,
+            )
+            b.callback = cb
+            self.add_item(b)
+
+    # --- 콜백 ---
+    async def _on_role(self, interaction: discord.Interaction, select) -> None:
+        await self._apply(interaction, staff=int(select.values[0]))
+
+    async def _on_category(self, interaction: discord.Interaction, select) -> None:
+        await self._apply(interaction, category=int(select.values[0]))
+
+    async def _on_reason_on(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, reason=True)
+
+    async def _on_reason_off(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, reason=False)
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, staff=None, category=None)
+
+    async def _on_reset(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, counter=0)
+
+    # --- 공통 ---
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
+        )
+
+    async def _apply(self, interaction: discord.Interaction, **fields) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not can_admin(interaction):
+            await self._deny(interaction)
+            return
+        update_settings(guild.id, **fields)
+        prune_missing(guild)
+        await interaction.response.edit_message(
+            embed=admin_embed(guild.id), view=TicketAdminView()
+        )
+
+
 def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
                        note: str | None = None) -> discord.Embed:
     n = int(rec.get("number", 0))
@@ -339,6 +456,22 @@ class PanelView(discord.ui.View):
     )
     async def open_general(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_open(interaction, GENERAL_KIND)
+
+    @discord.ui.button(
+        custom_id=TICKET_ADMIN_BTN,
+        label="⚙️ 티켓 관리",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def admin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None or not can_admin(interaction):
+            await interaction.response.send_message(
+                "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            embed=admin_embed(guild.id), view=TicketAdminView(), ephemeral=True
+        )
 
 
 class LegacyPanelView(discord.ui.View):
