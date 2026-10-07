@@ -426,13 +426,6 @@ p.msg{position:relative;z-index:1;margin:0;color:#b9c0da;font-size:14.5px;line-h
  word-break:keep-all}
 p.msg.ok{color:#7beda4}
 p.msg.no{color:#ff8a8a}
-.steps{position:relative;z-index:1;list-style:none;display:flex;gap:7px;margin:22px 0 0;padding:0}
-.steps li{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 4px;
- font-size:11px;color:#98a0bd;background:rgba(255,255,255,.045);
- border:1px solid var(--line);border-radius:13px}
-.steps b{width:21px;height:21px;border-radius:50%;display:flex;align-items:center;
- justify-content:center;font-size:11px;color:#fff;
- background:linear-gradient(135deg,#5865f2,#8b5cf6);box-shadow:0 4px 12px rgba(88,101,242,.5)}
 a.btn{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:9px;
  margin-top:24px;padding:15px 20px;border-radius:15px;text-decoration:none;color:#fff;
  font-size:16px;font-weight:700;letter-spacing:-.01em;
@@ -444,11 +437,8 @@ a.btn:hover{transform:translateY(-2px);filter:brightness(1.07);
 a.btn:active{transform:translateY(0)}
 a.btn .arrow{transition:transform .16s ease}
 a.btn:hover .arrow{transform:translateX(5px)}
-.note{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:7px;
- margin-top:18px;padding:9px 15px;border-radius:999px;font-size:12.5px;color:#98a0bd;
- background:rgba(255,255,255,.05);border:1px solid var(--line)}
 .foot{position:relative;z-index:1;margin:16px 0 0;font-size:11px;color:#6e7593;letter-spacing:.05em}
-@media (max-width:420px){.card{padding:34px 22px 26px}h1{font-size:24px}.steps li{font-size:10px}}
+@media (max-width:420px){.card{padding:34px 22px 26px}h1{font-size:24px}}
 """
 
 
@@ -469,7 +459,6 @@ def page(title: str, msg: str, ok: bool) -> web.Response:
             f"<h1>{html.escape(title)}</h1>"
             "<div class='line'></div>"
             f"<p class='msg {cls}'>{msg}</p>"
-            "<div class='note'>🔒 안전한 HTTPS 연결</div>"
             "<p class='foot'>창을 닫고 디스코드로 돌아가세요</p>"
             "</section></div></body></html>"
         ),
@@ -699,12 +688,8 @@ async def index(request: web.Request) -> web.Response:
             "<p class='eyebrow'>Discord Verification</p>"
             f"<h1>{title}</h1>"
             "<div class='line'></div>"
-            "<p class='msg'>본인 확인을 위해 아래 버튼을 눌러주세요.<br>"
-            "인증이 끝나면 바로 서버 활동을 시작할 수 있습니다.</p>"
-            "<ol class='steps'><li><b>1</b>인증 버튼</li>"
-            "<li><b>2</b>Discord 로그인</li><li><b>3</b>역할 지급</li></ol>"
+            "<p class='msg'>아래 버튼을 눌러 인증해주세요.</p>"
             f"<a class='btn' href='{url}'>인증하기 <span class='arrow'>→</span></a>"
-            "<div class='note'>🔒 Discord 공식 로그인 · 비밀번호를 요구하지 않습니다</div>"
             "</section></div></body></html>"
         ),
         content_type="text/html",
@@ -808,13 +793,7 @@ async def callback(request: web.Request) -> web.Response:
         log.info("web verified: %s guild=%s", user_id, guild_id)
         # role_text 는 "<@&id> (역할명)" 형태 → 웹에는 역할명만 표시
         role_label = role_text.split("(", 1)[1].rstrip(")") if "(" in role_text else ""
-        if role_label:
-            ok_msg = (
-                f"`{html.escape(role_label)}` 역할이 지급됐습니다.<br>"
-                "이제 서버의 모든 채널을 이용할 수 있어요."
-            )
-        else:
-            ok_msg = "역할이 지급됐습니다. 즐거운 활동 되세요!"
+        ok_msg = f"`{html.escape(role_label)}` 역할이 지급되었습니다." if role_label else "역할이 지급되었습니다."
         return page("인증 완료", ok_msg, True)
 
 
