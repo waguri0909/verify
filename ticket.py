@@ -332,11 +332,25 @@ class TicketAdminView(discord.ui.View):
             self.add_item(b)
 
     # --- 콜백 ---
-    async def _on_role(self, interaction: discord.Interaction, select) -> None:
-        await self._apply(interaction, staff=int(select.values[0]))
+    # discord.py 는 item.callback(interaction) 만 넘긴다.
+    # 데코레이터로 정의하면 _ItemCallback 이 아이템을 따로 끼워주지만,
+    # 이렇게 직접 할당하면 interaction 하나만 받는다 → 값은 interaction.data 에서 읽는다.
+    @staticmethod
+    def _selected(interaction: discord.Interaction) -> int | None:
+        values = (interaction.data or {}).get("values") or []
+        return int(values[0]) if values else None
 
-    async def _on_category(self, interaction: discord.Interaction, select) -> None:
-        await self._apply(interaction, category=int(select.values[0]))
+    async def _on_role(self, interaction: discord.Interaction) -> None:
+        picked = self._selected(interaction)
+        if picked is None:
+            return
+        await self._apply(interaction, staff=picked)
+
+    async def _on_category(self, interaction: discord.Interaction) -> None:
+        picked = self._selected(interaction)
+        if picked is None:
+            return
+        await self._apply(interaction, category=picked)
 
     async def _on_reason_on(self, interaction: discord.Interaction) -> None:
         await self._apply(interaction, reason=True)
