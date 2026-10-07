@@ -1,6 +1,6 @@
 """티켓(문의) 시스템.
 
-흐름: 패널 [티켓 열기] → (사유 입력 모달, 켜져 있을 때만) → 전용 채널 생성
+흐름: 패널 버튼(구매 문의 / 일반·파트너 문의) → (사유 입력 모달, 켜져 있을 때만) → 전용 채널 생성
 → [닫기]로 잠금 → [삭제] / [재오픈].
 
 - 1인 1개까지만 열림 (이미 열려 있으면 그 채널로 안내)
@@ -24,14 +24,20 @@ BASE_DIR = Path(__file__).parent
 STORE = BASE_DIR / "tickets.json"
 
 # 버튼 custom_id (고정값이어야 재시작 후에도 persistent view 로 동작)
-OPEN_BTN = "ticket:open"
+OPEN_PURCHASE_BTN = "ticket:open:purchase"
+OPEN_GENERAL_BTN = "ticket:open:general"
+OPEN_BTN = "ticket:open"  # 예전 단일 버튼 패널 (LegacyPanelView) 에서만 사용
 CLOSE_BTN = "ticket:close"
 DELETE_BTN = "ticket:delete"
 REOPEN_BTN = "ticket:reopen"
 
+# 패널 버튼 2개에 붙는 문의 유형 (티켓 기록에 저장되고 임베드에 표시)
+PURCHASE_KIND = "구매 문의"
+GENERAL_KIND = "일반 / 파트너 문의"
+
 DEFAULT_TITLE = "🎫 고객센터"
 DEFAULT_DESC = (
-    "문의할 일이 있으시면 아래 **티켓 열기** 버튼을 눌러주세요.\n"
+    "문의할 일이 있으시면 아래 버튼 중 해당하는 항목을 눌러주세요.\n"
     "누르면 나만 볼 수 있는 전용 채널이 만들어지고, 거기서 이야기를 나눕니다.\n"
     "한 명당 **1개**까지만 열 수 있어요."
 )
@@ -261,6 +267,8 @@ def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
         footer = "다시 열거나 삭제하려면 아래 버튼을 눌러주세요"
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="문의자", value=f"<@{rec.get('owner')}> (`{rec.get('owner')}`)", inline=False)
+    if rec.get("kind"):
+        embed.add_field(name="문의 유형", value=str(rec["kind"])[:100], inline=True)
     embed.add_field(name="사유", value=(rec.get("reason") or "미입력")[:1000], inline=False)
     embed.add_field(name="열린 시각", value=opened, inline=True)
     if status != "open":
@@ -311,9 +319,30 @@ class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    @discord.ui.button(
+        custom_id=OPEN_PURCHASE_BTN, label="🛒 구매 문의", style=discord.ButtonStyle.blurple
+    )
+    async def open_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_open(interaction, PURCHASE_KIND)
+
+    @discord.ui.button(
+        custom_id=OPEN_GENERAL_BTN,
+        label="❓ 일반 / 파트너 문의",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def open_general(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_open(interaction, GENERAL_KIND)
+
+
+class LegacyPanelView(discord.ui.View):
+    """이전에 게시된 단일 버튼 패널이 그대로 눌리도록 유지하는 뷰."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
     @discord.ui.button(custom_id=OPEN_BTN, label="티켓 열기 🎫", style=discord.ButtonStyle.blurple)
     async def open(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_open(interaction)
+        await handle_open(interaction, GENERAL_KIND)
 
 
 class TicketView(discord.ui.View):
@@ -351,13 +380,17 @@ class ReasonModal(discord.ui.Modal, title="티켓 열기"):
         placeholder="무엇을 도와드릴까요? (비워두고 열 수도 있어요)",
     )
 
+    def __init__(self, kind: str | None = None):
+        super().__init__()
+        self.kind = kind
+
     async def on_submit(self, interaction: discord.Interaction):
         text = str(self.reason.value or "").strip()
-        await _create(interaction, text or None)
+        await _create(interaction, text or None, self.kind)
 
 
 # ---------- 티켓 열기 ----------
-async def handle_open(interaction: discord.Interaction) -> None:
+async def handle_open(interaction: discord.Interaction, kind: str | None = None) -> None:
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있어요.", ephemeral=True)
@@ -373,12 +406,14 @@ async def handle_open(interaction: discord.Interaction) -> None:
         return
 
     if guild_settings(guild.id).get("reason", True):
-        await interaction.response.send_modal(ReasonModal())
+        await interaction.response.send_modal(ReasonModal(kind))
     else:
-        await _create(interaction, None)
+        await _create(interaction, None, kind)
 
 
-async def _create(interaction: discord.Interaction, reason: str | None) -> None:
+async def _create(
+    interaction: discord.Interaction, reason: str | None, kind: str | None = None
+) -> None:
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있어요.", ephemeral=True)
@@ -448,6 +483,7 @@ async def _create(interaction: discord.Interaction, reason: str | None) -> None:
         owner=user.id,
         number=number,
         reason=reason,
+        kind=kind,
         opened=_now(),
         status="open",
         closed_by=None,

@@ -2,7 +2,7 @@
 
 인증: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
 이메일인증여부/중복IP 검사 → REST로 역할 지급.
-티켓: 패널 [티켓 열기] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
+티켓: 패널 [구매 문의] / [일반·파트너 문의] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
 봇+웹이 한 프로세스로 뜸 (무료 호스팅 1서비스용).
 
 실행:
@@ -78,6 +78,7 @@ tree = app_commands.CommandTree(bot)
 # 티켓 — 재시작 후에도 버튼이 계속 동작하도록 persistent view 등록
 ticket.bind(bot=bot, guild_fn=bot.get_guild)
 bot.add_view(ticket.PanelView())
+bot.add_view(ticket.LegacyPanelView())  # 버튼 1개짜리 구(舊) 패널이 계속 눌리도록
 bot.add_view(ticket.TicketView())
 bot.add_view(ticket.ClosedTicketView())
 
@@ -626,7 +627,7 @@ async def ticket_settings(
 
 
 @tree.command(name="티켓사유", description="티켓 열 때 사유 입력창 켜기/끄기 (관리자)")
-@app_commands.describe(상태="켜기 = [티켓 열기] 누르면 사유 입력 모달이 뜹니다")
+@app_commands.describe(상태="켜기 = 패널 버튼을 누르면 사유 입력 모달이 뜹니다")
 @app_commands.choices(
     상태=[
         app_commands.Choice(name="켜기", value="on"),
