@@ -50,7 +50,9 @@ python bot.py   # 봇 + 웹(:8000) 동시 실행
 Render 슬립 때문에 봇 명령어가 자주 죽는다면:
 - **웹(Render)**: 그대로. `DISABLE_BOT=1` 환경변수 추가 → 웹만 실행
 - **봇(디스호스트)**: Python 서버 생성 → 이 폴더 파일 업로드
-  (`bot.py`, `webverify.py`, `webapi.py`, `recover.py`, `requirements.txt`)
+  (`bot.py`, `main.py`, `ticket.py`, `joinleave.py`, `webverify.py`, `webapi.py`,
+  `recover.py`, `requirements.txt`, **`assets/` 폴더 통째로**)
+  - `assets/fonts/` 가 빠지면 배너 한글이 깨져 나옵니다
   → 시작 명령 `python bot.py` → 환경변수 설정 후 실행:
   `DISCORD_TOKEN`, `WEB_PUBLIC_URL`(Render 주소), `WEB_SECRET`(Render와 동일),
   `VERIFIED_ROLE_NAME`, `UNVERIFIED_ROLE_NAME`, `DISABLE_WEB=1`

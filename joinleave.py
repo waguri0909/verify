@@ -11,6 +11,8 @@
 Pretendard OTF 를 씁니다. 이미지 생성이 실패해도 로그는 반드시 나갑니다.
 """
 
+from __future__ import annotations
+
 import asyncio
 import io
 import json
@@ -19,7 +21,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
-from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+
+try:
+    from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+except ImportError:
+    # Pillow 미설치 서버에서도 봇이 죽지 않도록. 배너만 꺼지고 로그는 계속 돈다.
+    Image = ImageChops = ImageDraw = ImageFont = ImageOps = None  # type: ignore[assignment]
 
 log = logging.getLogger("joinleave")
 
@@ -219,6 +226,8 @@ def _paste_icon(canvas: Image.Image, data: bytes | None, label: str, accent) -> 
 def build_banner(kind: str, avatar: bytes | None, name: str, guild_name: str,
                  guild_icon: bytes | None = None) -> io.BytesIO:
     """입장/퇴장 전용 배너. 실패해도 예외는 밖으로 던진다(호출부에서 삼킴)."""
+    if Image is None:
+        raise RuntimeError("Pillow 미설치 — pip install Pillow")
     eye, title, accent, _ = EYE[kind]
     img = _gradient()
     img = _glow(img, GLOW_A, (250, 40), 400, 0.50)
