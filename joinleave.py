@@ -1,10 +1,11 @@
 """입장/퇴장 로그 + 전용 배너 이미지 생성.
 
-설정 저장: logs.json (서버별 채널 / on-off / 이미지 on-off)
+설정 저장: logs.json — 서버별로 **입장/퇴장 각각** 채널 · on-off · 이미지 on-off 를
+독립적으로 가집니다. (입장 채널 #a, 퇴장 채널 #b 처럼 다르게 지정 가능)
 
 흐름:
-  bot.py 의 on_member_join / on_member_remove 가 send() 를 부름
-  → 설정된 채널이 있으면 임베드(+배너) 전송, 없으면 False 반환
+  bot.py 의 on_member_join / on_member_remove 가 send(member, kind) 를 부름
+  → 해당 kind 설정에 채널이 잡혀 있으면 임베드(+배너) 전송, 없으면 False 반환
     → bot.py 는 False 면 기존 텍스트 로그(LOG_CHANNEL_ID)로 대체
 
 배너는 Pillow 로 매번 새로 그립니다. 폰트는 assets/fonts 에 있는
@@ -62,51 +63,64 @@ EYE = {
 }
 
 DEFAULTS = {"channel": None, "enabled": False, "image": True}
+SIDES = ("join", "leave")
+LABEL = {"join": "입장", "leave": "퇴장"}
 _FONT_CACHE: dict = {}
 _FALLOFF: Image.Image | None = None
 
 
-# ---------- 저장소 ----------
+# ---------- 저장소 (입장/퇴장은 각각 완전히 독립) ----------
 def _load() -> dict:
     try:
         data = json.loads(STORE.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
-            return data
+        if not (isinstance(data, dict) and isinstance(data.get("guilds"), dict)):
+            return {"guilds": {}}
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return {"guilds": {}}
+        return {"guilds": {}}
+    # 분리 전 공용 포맷이면 입장/퇴장 양쪽에 그대로 승계
+    for g in data["guilds"].values():
+        if isinstance(g, dict) and not any(k in g for k in SIDES):
+            shared = {k: g.pop(k) for k in list(g) if k in DEFAULTS}
+            for kind in SIDES:
+                g[kind] = {**DEFAULTS, **shared}
+    return data
 
 
 def _save(data: dict) -> None:
     STORE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def settings(guild_id: int) -> dict:
-    g = _load()["guilds"].get(str(guild_id))
+def settings(guild_id: int, kind: str) -> dict:
+    g = _load()["guilds"].get(str(guild_id), {})
+    side = g.get(kind) if isinstance(g, dict) else None
     out = dict(DEFAULTS)
-    if isinstance(g, dict):
-        out.update({k: g[k] for k in DEFAULTS if k in g})
+    if isinstance(side, dict):
+        out.update({k: side[k] for k in DEFAULTS if k in side})
     return out
 
 
-def update(guild_id: int, **fields) -> dict:
+def update(guild_id: int, kind: str, **fields) -> dict:
     data = _load()
     g = data["guilds"].setdefault(str(guild_id), {})
+    for k in list(g):  # 분리 전 잔여 공용 키 정리
+        if k in DEFAULTS:
+            del g[k]
+    side = g.setdefault(kind, dict(DEFAULTS))
     for k, v in fields.items():
         if k in DEFAULTS:
-            g[k] = v
+            side[k] = v
     _save(data)
-    return settings(guild_id)
+    return settings(guild_id, kind)
 
 
-def summary(guild_id: int) -> str:
-    s = settings(guild_id)
+def summary(guild_id: int, kind: str) -> str:
+    s = settings(guild_id, kind)
     ch = f"<#{s['channel']}>" if s.get("channel") else "미지정"
     on = "켜짐" if s.get("enabled") else "꺼짐"
     img = "붙임" if s.get("image") else "안 붙임"
     return (
         f"• 로그 채널: {ch}\n"
-        f"• 입장/퇴장 로그: **{on}**\n"
+        f"• {LABEL[kind]} 로그: **{on}**\n"
         f"• 안내 이미지: **{img}**"
     )
 
@@ -313,17 +327,17 @@ async def _guild_icon_of(guild: discord.Guild) -> bytes | None:
 
 
 # ---------- 로그 전송 ----------
-def is_active(guild_id: int) -> bool:
-    s = settings(guild_id)
+def is_active(guild_id: int, kind: str) -> bool:
+    s = settings(guild_id, kind)
     return bool(s.get("enabled") and s.get("channel"))
 
 
 async def send(member: discord.Member, kind: str, note: str | None = None) -> bool:
     """설정돼 있으면 로그를 보내고 True, 아니면 False (호출부가 대체 로그를 씀)."""
     guild = member.guild
-    if not is_active(guild.id):
+    if not is_active(guild.id, kind):
         return False
-    s = settings(guild.id)
+    s = settings(guild.id, kind)
     channel = guild.get_channel(int(s["channel"]))
     if not isinstance(channel, discord.TextChannel):
         return False

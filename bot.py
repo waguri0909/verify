@@ -3,7 +3,7 @@
 인증: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
 이메일인증여부/중복IP 검사 → REST로 역할 지급.
 티켓: 패널 [결제·주문 문의] / [일반·파트너 문의] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
-로그: /로그설정 → 입장/퇴장 임베드 (+ Pillow 로 그린 전용 배너)
+로그: /입장로그 · /퇴장로그 → 각각 채널/켜기/이미지 독립 설정 (+ Pillow 전용 배너)
 봇+웹이 한 프로세스로 뜸 (무료 호스팅 1서비스용).
 
 실행:
@@ -271,7 +271,7 @@ async def on_member_join(member: discord.Member):
         if age_days < config.min_account_age_days:
             warn = f" ⚠️ 계정생성 {age_days}일 (기준 {config.min_account_age_days}일 미만)"
 
-    # 입장 로그: /로그설정 에 채널이 잡혀 있으면 임베드(+배너), 아니면 기존 텍스트 로그
+    # 입장 로그: /입장로그 에 채널이 잡혀 있으면 임베드(+배너), 아니면 기존 텍스트 로그
     if not await joinleave.send(member, "join", note=warn.strip() or None):
         await send_log(guild, f"👋 **입장** {member.mention} (`{member}`){warn}")
 
@@ -664,33 +664,18 @@ async def ticket_close_cmd(interaction: discord.Interaction, 사유: str | None 
     await ticket.close_ticket(interaction, note=(사유 or "").strip() or None)
 
 
-@tree.command(name="로그설정", description="입장/퇴장 로그 설정 (관리자)")
-@app_commands.describe(
-    채널="로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
-    상태="로그 켜기/끄기",
-    이미지="안내 이미지 붙이기/빼기",
-    미리보기="지금 설정대로 안내 이미지를 미리 보여줍니다",
-)
-@app_commands.choices(
-    상태=[
-        app_commands.Choice(name="켜기", value="on"),
-        app_commands.Choice(name="끄기", value="off"),
-    ],
-    이미지=[
-        app_commands.Choice(name="붙이기", value="on"),
-        app_commands.Choice(name="빼기", value="off"),
-    ],
-)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def log_settings(
+async def _log_command(
     interaction: discord.Interaction,
-    채널: discord.abc.GuildChannel | None = None,
-    상태: app_commands.Choice[str] | None = None,
-    이미지: app_commands.Choice[str] | None = None,
-    미리보기: bool = False,
+    kind: str,
+    채널: discord.abc.GuildChannel | None,
+    상태: app_commands.Choice[str] | None,
+    이미지: app_commands.Choice[str] | None,
+    미리보기: bool,
 ):
+    """입장/퇴장 로그 공용 처리 — 설정은 서로 완전히 독립이다."""
     guild = interaction.guild
     assert guild is not None
+    label = joinleave.LABEL[kind]
     fields: dict = {}
     if 채널 is not None:
         target = 채널.parent if isinstance(채널, discord.Thread) else 채널
@@ -706,21 +691,20 @@ async def log_settings(
     if 이미지 is not None:
         fields["image"] = 이미지.value == "on"
     if fields:
-        joinleave.update(guild.id, **fields)
-        head = "✅ 로그 설정을 바꿨어요.\n"
+        joinleave.update(guild.id, kind, **fields)
+        head = f"✅ {label} 로그 설정을 바꿨어요.\n"
     else:
-        head = "현재 입장/퇴장 로그 설정이에요.\n"
-    body = head + joinleave.summary(guild.id)
+        head = f"현재 {label} 로그 설정이에요.\n"
+    body = head + joinleave.summary(guild.id, kind)
 
     if 미리보기:
         await interaction.response.defer(ephemeral=True)
-        s = joinleave.settings(guild.id)
+        s = joinleave.settings(guild.id, kind)
         dest = guild.get_channel(int(s["channel"])) if s.get("channel") else None
         if not isinstance(dest, discord.TextChannel):
             dest = interaction.channel
         try:
-            await joinleave.preview(interaction.user, dest, "join")
-            await joinleave.preview(interaction.user, dest, "leave")
+            await joinleave.preview(interaction.user, dest, kind)
             await interaction.followup.send(body, ephemeral=True)
         except Exception as e:
             log.warning("미리보기 실패: %s", e)
@@ -728,6 +712,62 @@ async def log_settings(
         return
 
     await interaction.response.send_message(body, ephemeral=True)
+
+
+@tree.command(name="입장로그", description="입장 로그 설정 (관리자)")
+@app_commands.describe(
+    채널="입장 로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
+    상태="입장 로그 켜기/끄기",
+    이미지="안내 이미지 붙이기/빼기",
+    미리보기="안내 이미지를 미리 보여줍니다",
+)
+@app_commands.choices(
+    상태=[
+        app_commands.Choice(name="켜기", value="on"),
+        app_commands.Choice(name="끄기", value="off"),
+    ],
+    이미지=[
+        app_commands.Choice(name="붙이기", value="on"),
+        app_commands.Choice(name="빼기", value="off"),
+    ],
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def join_log_command(
+    interaction: discord.Interaction,
+    채널: discord.abc.GuildChannel | None = None,
+    상태: app_commands.Choice[str] | None = None,
+    이미지: app_commands.Choice[str] | None = None,
+    미리보기: bool = False,
+):
+    await _log_command(interaction, "join", 채널, 상태, 이미지, 미리보기)
+
+
+@tree.command(name="퇴장로그", description="퇴장 로그 설정 (관리자)")
+@app_commands.describe(
+    채널="퇴장 로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
+    상태="퇴장 로그 켜기/끄기",
+    이미지="안내 이미지 붙이기/빼기",
+    미리보기="안내 이미지를 미리 보여줍니다",
+)
+@app_commands.choices(
+    상태=[
+        app_commands.Choice(name="켜기", value="on"),
+        app_commands.Choice(name="끄기", value="off"),
+    ],
+    이미지=[
+        app_commands.Choice(name="붙이기", value="on"),
+        app_commands.Choice(name="빼기", value="off"),
+    ],
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def leave_log_command(
+    interaction: discord.Interaction,
+    채널: discord.abc.GuildChannel | None = None,
+    상태: app_commands.Choice[str] | None = None,
+    이미지: app_commands.Choice[str] | None = None,
+    미리보기: bool = False,
+):
+    await _log_command(interaction, "leave", 채널, 상태, 이미지, 미리보기)
 
 
 @tree.error
