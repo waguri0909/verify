@@ -4,6 +4,7 @@
 *.log
 __pycache__/
 panels.json
+roles.json
 tickets.json
 webhooks.json
 logs.json

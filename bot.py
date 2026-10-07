@@ -131,12 +131,40 @@ def get_panel_setting(message_id: int | None) -> dict | None:
     return _load_json(PANEL_FILE).get(str(message_id))
 
 
-def get_guild_panel_role(guild_id: int) -> int | None:
-    """이 서버에 역할 지정된 패널이 있으면 첫 번째 인증 롤 ID."""
-    for v in _load_json(PANEL_FILE).values():
-        if isinstance(v, dict) and v.get("guild") == guild_id and v.get("verified"):
-            return int(v["verified"])
-    return None
+# 서버 단위 역할 설정은 panels.json 대신 roles.json 에 둔다.
+# panels.json 은 패널을 지우면 그 항목이 날아가고, 둘 다 .gitignore 대상이라
+# 재업로드 때 통째로 덮어씌워지기 쉬우므로 한 파일에 몰아두지 않았다.
+ROLES_FILE = BASE_DIR / "roles.json"
+
+
+def get_guild_roles(guild_id: int) -> dict:
+    raw = _load_json(ROLES_FILE).get(str(guild_id))
+    return raw if isinstance(raw, dict) else {}
+
+
+def set_guild_role(guild_id: int, kind: str, role_id: int | None) -> None:
+    """서버에 역할 하나를 지정/해제한다. (kind = verified / unverified)"""
+    data = _load_json(ROLES_FILE)
+    g = data.get(str(guild_id))
+    if not isinstance(g, dict):
+        g = {}
+    if role_id is None:
+        g.pop(kind, None)
+    else:
+        g[kind] = role_id
+    if g:
+        data[str(guild_id)] = g
+    else:
+        data.pop(str(guild_id), None)
+    _save_json(ROLES_FILE, data)
+
+
+def _role_from(guild: discord.Guild, role_id) -> discord.Role | None:
+    """ID 가 깨졌거나 삭제된 역할이면 None — 뒤 후보를 계속 살펴보게 한다."""
+    try:
+        return guild.get_role(int(role_id))
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------- 롤/로그 헬퍼 ----------
@@ -155,17 +183,31 @@ def resolve_role(guild: discord.Guild, name_or_id: str) -> discord.Role | None:
 
 
 def resolve_verified_role(guild: discord.Guild, message_id: int | None = None) -> discord.Role | None:
+    # 1) /인증관리 에서 직접 지정해 둔 역할
+    r = _role_from(guild, get_guild_roles(guild.id).get("verified"))
+    if r:
+        return r
+    # 2) 패널 게시 기록 — 패널마다 하나씩 보면서 실제로 존재하는 역할을 찾는다.
+    #    (옛 구조는 첫 패널만 보고, 그 패널의 역할이 삭제돼 있으면 뒤를 못 봤다)
     panel = get_panel_setting(message_id)
-    if panel and panel.get("verified"):
-        r = guild.get_role(int(panel["verified"]))
+    if panel:
+        r = _role_from(guild, panel.get("verified"))
         if r:
             return r
-    role_id = get_guild_panel_role(guild.id)
-    if role_id:
-        r = guild.get_role(role_id)
-        if r:
-            return r
+    for v in _load_json(PANEL_FILE).values():
+        if isinstance(v, dict) and v.get("guild") == guild.id:
+            r = _role_from(guild, v.get("verified"))
+            if r:
+                return r
+    # 3) .env
     return resolve_role(guild, config.verified_role)
+
+
+def resolve_unverified_role(guild: discord.Guild) -> discord.Role | None:
+    r = _role_from(guild, get_guild_roles(guild.id).get("unverified"))
+    if r:
+        return r
+    return resolve_role(guild, config.unverified_role)
 
 
 async def send_log(guild: discord.Guild, text: str):
@@ -255,7 +297,7 @@ async def on_guild_join(guild: discord.Guild):
 async def on_member_join(member: discord.Member):
     guild = member.guild
     verified = resolve_verified_role(guild)
-    unverified = resolve_role(guild, config.unverified_role)
+    unverified = resolve_unverified_role(guild)
 
     try:
         if unverified:
@@ -367,6 +409,9 @@ async def setup_panel(
         "line1": 문장1,
         "line2": 문장2,
     }
+    # 패널에 지정한 역할을 서버 기본값으로도 남긴다.
+    # → 패널 메시지를 지워도 /인증관리 와 입장 로그가 같은 역할을 쓴다.
+    set_guild_role(guild.id, "verified", verified.id)
     _save_json(PANEL_FILE, panels)
     await interaction.followup.send(
         f"{target.mention}에 인증 패널을 올렸어요. ✅\n"
@@ -441,7 +486,7 @@ class UnverifyModal(discord.ui.Modal, title="인증 초기화"):
             )
             return
         verified = resolve_verified_role(guild)
-        unverified = resolve_role(guild, config.unverified_role)
+        unverified = resolve_unverified_role(guild)
         await interaction.response.defer(ephemeral=True)
         try:
             if verified and verified in member.roles:
@@ -627,10 +672,10 @@ class VerifyPanelView(discord.ui.View):
 
 def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
     verified = resolve_verified_role(guild)
-    unverified = resolve_role(guild, config.unverified_role)
+    unverified = resolve_unverified_role(guild)
     embed = discord.Embed(
         title="🛠️ 인증 관리",
-        description="인증 관리 버튼 (서버 관리자 전용)",
+        description="위 드롭다운으로 역할을 지정하고, 아래 버튼으로 인증을 관리해요.",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
@@ -640,34 +685,109 @@ def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(
         name="미인증 역할", value=unverified.mention if unverified else "미지정", inline=True
     )
+    missing = [
+        label
+        for label, r in (("지급", verified), ("미인증", unverified))
+        if r is None
+    ]
+    if missing:
+        embed.add_field(
+            name="⚠️ 역할을 아직 못 찾았어요",
+            value=(
+                f"**{'·'.join(missing)} 역할**이 미지정입니다.\n"
+                "위 드롭다운에서 골라주면 바로 저장돼요.\n"
+                "(.env 의 `VERIFIED_ROLE_NAME` / `UNVERIFIED_ROLE_NAME` 값은\n"
+                "서버에 있는 실제 **역할 이름**과 빠짐없이 일치해야 해요)"
+            ),
+            inline=False,
+        )
     return embed
 
 
 class VerifyAdminView(discord.ui.View):
-    """인증 관리자 버튼 5개 — /인증관리 명령으로만 열리는 ephemeral 패널.
+    """인증 관리 패널 — /인증관리 명령으로만 열리는 ephemeral 뷰.
 
+    위 두 줄(RoleSelect)으로 지급/미인증 역할을 그자리에서 지정하고,
+    아래 버튼 5개로 인증 초기화·웹훅·복구를 다룬다.
     custom_id 고정 → bot.add_view 로 영구 유지.
     채널에 게시되는 메시지에는 절대 붙지 않으므로 유저는 볼 수 없다.
     """
 
     def __init__(self):
         super().__init__(timeout=None)
+
+        vs = discord.ui.RoleSelect(
+            custom_id="verify:role:verified",
+            placeholder="지급 역할 — 인증 완료자가 받는 역할",
+            min_values=1, max_values=1, row=0,
+        )
+        vs.callback = self._on_verified_role
+        self.add_item(vs)
+
+        us = discord.ui.RoleSelect(
+            custom_id="verify:role:unverified",
+            placeholder="미인증 역할 — 입장 시 먼저 받는 역할",
+            min_values=1, max_values=1, row=1,
+        )
+        us.callback = self._on_unverified_role
+        self.add_item(us)
+
         specs = [
             ("verify:admin:reset", "🔄 인증 초기화",
-             discord.ButtonStyle.secondary, self._reset, 1),
+             discord.ButtonStyle.secondary, self._reset, 2),
             ("verify:webhook:set", "📜 웹훅 등록",
-             discord.ButtonStyle.secondary, self._webhook_set, 1),
+             discord.ButtonStyle.secondary, self._webhook_set, 2),
             ("verify:webhook:clear", "🗑 웹훅 해제",
-             discord.ButtonStyle.red, self._webhook_clear, 1),
+             discord.ButtonStyle.red, self._webhook_clear, 2),
             ("verify:recover:key", "🔑 복구키 확인",
-             discord.ButtonStyle.secondary, self._recover_key, 2),
+             discord.ButtonStyle.secondary, self._recover_key, 3),
             ("verify:recover:run", "♻️ 복구 실행",
-             discord.ButtonStyle.green, self._recover_run, 2),
+             discord.ButtonStyle.green, self._recover_run, 3),
         ]
         for cid, label, style, cb, row in specs:
             b = discord.ui.Button(custom_id=cid, label=label, style=style, row=row)
             b.callback = cb
             self.add_item(b)
+
+    # --- 역할 지정 (RoleSelect) ---
+    # discord.py 는 item.callback(interaction) 만 넘긴다 → 값은 interaction.data 에서.
+    @staticmethod
+    def _picked(interaction: discord.Interaction) -> int | None:
+        values = (interaction.data or {}).get("values") or []
+        return int(values[0]) if values else None
+
+    async def _set_role(
+        self, interaction: discord.Interaction, kind: str, must_be_grantable: bool
+    ) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        rid = self._picked(interaction)
+        if guild is None or rid is None:
+            return
+        role = guild.get_role(rid)
+        if role is None:
+            await _deny(interaction)
+            return
+        me = guild.me
+        if must_be_grantable and me and me.top_role <= role:
+            await interaction.response.send_message(
+                f"❌ {role.mention}이(가) 봇 롤보다 높아서 지급할 수 없어요.\n"
+                f"서버 설정 → 역할에서 **봇 롤을 위로** 올려주세요.",
+                ephemeral=True,
+            )
+            return
+        set_guild_role(guild.id, kind, role.id)
+        await interaction.response.edit_message(
+            embed=verify_admin_embed(guild), view=VerifyAdminView()
+        )
+
+    async def _on_verified_role(self, interaction: discord.Interaction) -> None:
+        await self._set_role(interaction, "verified", True)
+
+    async def _on_unverified_role(self, interaction: discord.Interaction) -> None:
+        await self._set_role(interaction, "unverified", False)
 
     async def _reset(self, interaction: discord.Interaction) -> None:
         if not _verify_admin_ok(interaction):
