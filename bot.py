@@ -3,6 +3,7 @@
 인증: 패널 [웹에서 인증하기] → Discord 승인 → 웹사이트에서
 이메일인증여부/중복IP 검사 → REST로 역할 지급.
 티켓: 패널 [결제·주문 문의] / [일반·파트너 문의] → 1인 1개 전용 채널 → [닫기] → [삭제]/[재오픈].
+로그: /로그설정 → 입장/퇴장 임베드 (+ Pillow 로 그린 전용 배너)
 봇+웹이 한 프로세스로 뜸 (무료 호스팅 1서비스용).
 
 실행:
@@ -26,6 +27,7 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
+import joinleave
 import recover
 import ticket
 import webapi
@@ -269,7 +271,9 @@ async def on_member_join(member: discord.Member):
         if age_days < config.min_account_age_days:
             warn = f" ⚠️ 계정생성 {age_days}일 (기준 {config.min_account_age_days}일 미만)"
 
-    await send_log(guild, f"👋 **입장** {member.mention} (`{member}`){warn}")
+    # 입장 로그: /로그설정 에 채널이 잡혀 있으면 임베드(+배너), 아니면 기존 텍스트 로그
+    if not await joinleave.send(member, "join", note=warn.strip() or None):
+        await send_log(guild, f"👋 **입장** {member.mention} (`{member}`){warn}")
 
     if config.auth_channel_id:
         ch = guild.get_channel(config.auth_channel_id)
@@ -281,6 +285,13 @@ async def on_member_join(member: discord.Member):
                 )
             except discord.HTTPException:
                 pass
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """퇴장 로그. joinleave 미설정이면 기존 LOG_CHANNEL_ID 텍스트 로그로 대체."""
+    if not await joinleave.send(member, "leave"):
+        await send_log(member.guild, f"👋 **퇴장** {member.mention} (`{member}`)")
 
 
 # ---------- 슬래시 명령 ----------
@@ -651,6 +662,72 @@ async def ticket_reason(interaction: discord.Interaction, 상태: app_commands.C
 @app_commands.describe(사유="남길 말 (선택, 티켓 기록에 남습니다)")
 async def ticket_close_cmd(interaction: discord.Interaction, 사유: str | None = None):
     await ticket.close_ticket(interaction, note=(사유 or "").strip() or None)
+
+
+@tree.command(name="로그설정", description="입장/퇴장 로그 설정 (관리자)")
+@app_commands.describe(
+    채널="로그를 보낼 텍스트 채널 (지정하면 로그가 바로 켜집니다)",
+    상태="로그 켜기/끄기",
+    이미지="안내 이미지 붙이기/빼기",
+    미리보기="지금 설정대로 안내 이미지를 미리 보여줍니다",
+)
+@app_commands.choices(
+    상태=[
+        app_commands.Choice(name="켜기", value="on"),
+        app_commands.Choice(name="끄기", value="off"),
+    ],
+    이미지=[
+        app_commands.Choice(name="붙이기", value="on"),
+        app_commands.Choice(name="빼기", value="off"),
+    ],
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def log_settings(
+    interaction: discord.Interaction,
+    채널: discord.abc.GuildChannel | None = None,
+    상태: app_commands.Choice[str] | None = None,
+    이미지: app_commands.Choice[str] | None = None,
+    미리보기: bool = False,
+):
+    guild = interaction.guild
+    assert guild is not None
+    fields: dict = {}
+    if 채널 is not None:
+        target = 채널.parent if isinstance(채널, discord.Thread) else 채널
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ **채널** 칸에는 일반 텍스트 채널만 골라주세요.", ephemeral=True
+            )
+            return
+        fields["channel"] = target.id
+        fields["enabled"] = True  # 채널을 지정하면 자연스럽게 켜지는 게 직관적
+    if 상태 is not None:
+        fields["enabled"] = 상태.value == "on"
+    if 이미지 is not None:
+        fields["image"] = 이미지.value == "on"
+    if fields:
+        joinleave.update(guild.id, **fields)
+        head = "✅ 로그 설정을 바꿨어요.\n"
+    else:
+        head = "현재 입장/퇴장 로그 설정이에요.\n"
+    body = head + joinleave.summary(guild.id)
+
+    if 미리보기:
+        await interaction.response.defer(ephemeral=True)
+        s = joinleave.settings(guild.id)
+        dest = guild.get_channel(int(s["channel"])) if s.get("channel") else None
+        if not isinstance(dest, discord.TextChannel):
+            dest = interaction.channel
+        try:
+            await joinleave.preview(interaction.user, dest, "join")
+            await joinleave.preview(interaction.user, dest, "leave")
+            await interaction.followup.send(body, ephemeral=True)
+        except Exception as e:
+            log.warning("미리보기 실패: %s", e)
+            await interaction.followup.send(f"❌ 미리보기 실패: {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(body, ephemeral=True)
 
 
 @tree.error

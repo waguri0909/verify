@@ -6,3 +6,4 @@ __pycache__/
 panels.json
 tickets.json
 webhooks.json
+logs.json
