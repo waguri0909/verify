@@ -1,6 +1,6 @@
 """티켓(문의) 시스템.
 
-흐름: 패널 버튼(구매 문의 / 일반·파트너 문의) → (사유 입력 모달, 켜져 있을 때만) → 전용 채널 생성
+흐름: 패널 버튼(결제·주문 / 일반·파트너) → (사유 입력 모달, 켜져 있을 때만) → 전용 채널 생성
 → [닫기]로 잠금 → [삭제] / [재오픈].
 
 - 1인 1개까지만 열림 (이미 열려 있으면 그 채널로 안내)
@@ -32,14 +32,16 @@ DELETE_BTN = "ticket:delete"
 REOPEN_BTN = "ticket:reopen"
 
 # 패널 버튼 2개에 붙는 문의 유형 (티켓 기록에 저장되고 임베드에 표시)
-PURCHASE_KIND = "구매 문의"
-GENERAL_KIND = "일반 / 파트너 문의"
+PURCHASE_KIND = "결제 · 주문 문의"
+GENERAL_KIND = "일반 · 파트너 문의"
 
-DEFAULT_TITLE = "🎫 고객센터"
+DEFAULT_TITLE = "🎫 고객 지원 센터"
 DEFAULT_DESC = (
-    "문의할 일이 있으시면 아래 버튼 중 해당하는 항목을 눌러주세요.\n"
-    "누르면 나만 볼 수 있는 전용 채널이 만들어지고, 거기서 이야기를 나눕니다.\n"
-    "한 명당 **1개**까지만 열 수 있어요."
+    "문의가 있으시면 아래 버튼을 눌러주세요.\n"
+    "누르면 **나만 보이는 전용 채널**이 생성되고,\n"
+    "담당 스태프가 확인한 뒤 바로 답변드릴게요.\n\n"
+    "──────────────\n"
+    "🔒 한 명당 **1개**까지 열 수 있어요"
 )
 
 
@@ -247,7 +249,7 @@ def build_panel(title: str | None = None, desc: str | None = None) -> discord.Em
     embed = discord.Embed(
         title=(title or DEFAULT_TITLE)[:200],
         description=(desc or DEFAULT_DESC)[:2000],
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(99, 102, 241),
         timestamp=datetime.now(timezone.utc),
     )
     return embed
@@ -261,15 +263,19 @@ def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
         title = f"🎫 티켓 {number_label(n)}"
         color = discord.Color.blurple()
         footer = "대화가 끝나면 [닫기] 를 눌러주세요"
+        desc = "이 채널은 **문의자와 스태프**만 볼 수 있습니다.\n아래에서 편하게 이야기해주세요."
     else:
         title = f"🔒 티켓 {number_label(n)} · 닫힘"
         color = discord.Color.dark_grey()
         footer = "다시 열거나 삭제하려면 아래 버튼을 눌러주세요"
-    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+        desc = "문의가 종료됐습니다.\n필요하면 **재오픈**하거나 채널을 삭제할 수 있어요."
+    embed = discord.Embed(
+        title=title, description=desc, color=color, timestamp=datetime.now(timezone.utc)
+    )
     embed.add_field(name="문의자", value=f"<@{rec.get('owner')}> (`{rec.get('owner')}`)", inline=False)
+    embed.add_field(name="사유", value=(rec.get("reason") or "미입력")[:1000], inline=False)
     if rec.get("kind"):
         embed.add_field(name="문의 유형", value=str(rec["kind"])[:100], inline=True)
-    embed.add_field(name="사유", value=(rec.get("reason") or "미입력")[:1000], inline=False)
     embed.add_field(name="열린 시각", value=opened, inline=True)
     if status != "open":
         embed.add_field(name="닫은 사람", value=f"<@{closed_by}>" if closed_by else "-", inline=True)
@@ -320,14 +326,15 @@ class PanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        custom_id=OPEN_PURCHASE_BTN, label="🛒 구매 문의", style=discord.ButtonStyle.blurple
+        custom_id=OPEN_PURCHASE_BTN, label="💳 결제 · 주문 문의",
+        style=discord.ButtonStyle.blurple,
     )
     async def open_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_open(interaction, PURCHASE_KIND)
 
     @discord.ui.button(
         custom_id=OPEN_GENERAL_BTN,
-        label="❓ 일반 / 파트너 문의",
+        label="💬 일반 · 파트너 문의",
         style=discord.ButtonStyle.secondary,
     )
     async def open_general(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -492,7 +499,8 @@ async def _create(
     embed = build_ticket_embed(rec, "open")
     try:
         msg = await channel.send(
-            f"{user.mention}님 문의 접수되었습니다. 스태프가 곧 확인합니다.",
+            f"{user.mention}님 **문의가 접수됐습니다.** "
+            f"담당 스태프가 확인하면 곧 답변드릴게요.",
             embed=embed,
             view=TicketView(),
         )

@@ -372,34 +372,107 @@ async def notify_webhook(embed: dict):
 
 
 # ---------- HTML ----------
-CSS = (
-    "body{margin:0;min-height:100vh;color:#fff;font-family:'Pretendard',sans-serif;"
-    "background:#0b0e1a radial-gradient(600px 400px at 50% 20%,#1c2140 0%,#0b0e1a 70%);"
-    "display:flex;justify-content:center;align-items:center}"
-    ".card{background:rgba(22,26,43,.85);backdrop-filter:blur(8px);"
-    "border:1px solid #2a2f45;border-radius:20px;padding:48px 56px;text-align:center;"
-    "max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.5)}"
-    ".icon{width:96px;height:96px;border-radius:50%;object-fit:cover;margin:0 auto 16px;display:block}"
-    ".lock{font-size:56px;margin-bottom:8px}"
-    "h1{margin:0 0 28px;font-size:28px;font-weight:800}"
-    "p{color:#b5bac1;font-size:15px;line-height:1.7}"
-    ".ok{color:#57f287}.no{color:#ed4245}"
-    "a.btn{display:inline-block;background:#5865f2;color:#fff;font-size:17px;font-weight:700;"
-    "padding:14px 56px;border-radius:10px;text-decoration:none;transition:.15s}"
-    "a.btn:hover{background:#4752c4;transform:translateY(-1px)}"
-)
+CSS = """
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
+:root{--txt:#eef0f8;--sub:#98a0bd;--line:rgba(255,255,255,.09);--card:rgba(17,20,36,.72)}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;padding:24px;color:var(--txt);
+ font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;
+ background:
+  radial-gradient(900px 520px at 10% -12%,rgba(88,101,242,.40),transparent 60%),
+  radial-gradient(780px 500px at 94% 6%,rgba(139,92,246,.30),transparent 62%),
+  radial-gradient(760px 760px at 50% 116%,rgba(56,189,248,.18),transparent 62%),
+  linear-gradient(165deg,#080a16 0%,#0b0e1a 48%,#070912 100%);
+ background-attachment:fixed;-webkit-font-smoothing:antialiased;
+ display:flex;align-items:center;justify-content:center}
+.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.42;pointer-events:none;z-index:0}
+.orb.a{width:420px;height:420px;left:-130px;top:-130px;background:#5865f2;
+ animation:drift 17s ease-in-out infinite}
+.orb.b{width:400px;height:400px;right:-120px;bottom:-140px;background:#8b5cf6;
+ animation:drift 21s ease-in-out infinite reverse}
+@keyframes drift{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(46px,-34px,0)}}
+.stage{position:relative;z-index:1;width:100%;max-width:430px;
+ animation:rise .55s cubic-bezier(.2,.8,.2,1) both}
+@keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+.card{position:relative;overflow:hidden;border-radius:26px;padding:40px 34px 30px;
+ text-align:center;
+ background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.02)),var(--card);
+ backdrop-filter:blur(20px) saturate(150%);
+ -webkit-backdrop-filter:blur(20px) saturate(150%);
+ border:1px solid var(--line);
+ box-shadow:0 34px 90px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.09)}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+ background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent)}
+.card::after{content:'';position:absolute;top:-150px;left:50%;width:280px;height:280px;
+ transform:translateX(-50%);border-radius:50%;filter:blur(14px);opacity:.34;pointer-events:none;
+ background:radial-gradient(circle,#5865f2,transparent 70%)}
+.card.ok::after{background:radial-gradient(circle,#3ba55d,transparent 70%)}
+.card.no::after{background:radial-gradient(circle,#ed4245,transparent 70%)}
+.badge{position:relative;z-index:1;width:86px;height:86px;margin:0 auto 18px;border-radius:50%;
+ display:flex;align-items:center;justify-content:center;font-size:38px;line-height:1;
+ background:linear-gradient(145deg,rgba(255,255,255,.15),rgba(255,255,255,.04));
+ border:1px solid rgba(255,255,255,.17);
+ box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(88,101,242,.12)}
+.badge.ok{color:#57f287;box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(87,242,135,.14)}
+.badge.no{color:#ff6b6b;box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(237,66,69,.16)}
+.badge img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block}
+.eyebrow{position:relative;z-index:1;margin:0 0 9px;font-size:10.5px;font-weight:800;
+ letter-spacing:.26em;color:var(--sub);text-transform:uppercase}
+h1{position:relative;z-index:1;margin:0 0 14px;font-size:27px;font-weight:800;
+ letter-spacing:-.02em;word-break:keep-all}
+.line{position:relative;z-index:1;height:1px;margin:0 0 16px;
+ background:linear-gradient(90deg,transparent,rgba(255,255,255,.2),transparent)}
+p.msg{position:relative;z-index:1;margin:0;color:#b9c0da;font-size:14.5px;line-height:1.75;
+ word-break:keep-all}
+p.msg.ok{color:#7beda4}
+p.msg.no{color:#ff8a8a}
+.steps{position:relative;z-index:1;list-style:none;display:flex;gap:7px;margin:22px 0 0;padding:0}
+.steps li{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 4px;
+ font-size:11px;color:#98a0bd;background:rgba(255,255,255,.045);
+ border:1px solid var(--line);border-radius:13px}
+.steps b{width:21px;height:21px;border-radius:50%;display:flex;align-items:center;
+ justify-content:center;font-size:11px;color:#fff;
+ background:linear-gradient(135deg,#5865f2,#8b5cf6);box-shadow:0 4px 12px rgba(88,101,242,.5)}
+a.btn{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:9px;
+ margin-top:24px;padding:15px 20px;border-radius:15px;text-decoration:none;color:#fff;
+ font-size:16px;font-weight:700;letter-spacing:-.01em;
+ background:linear-gradient(135deg,#5865f2 0%,#7b5cf5 55%,#8b5cf6 100%);
+ box-shadow:0 16px 34px rgba(88,101,242,.45),inset 0 1px 0 rgba(255,255,255,.3);
+ transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
+a.btn:hover{transform:translateY(-2px);filter:brightness(1.07);
+ box-shadow:0 20px 42px rgba(88,101,242,.6),inset 0 1px 0 rgba(255,255,255,.35)}
+a.btn:active{transform:translateY(0)}
+a.btn .arrow{transition:transform .16s ease}
+a.btn:hover .arrow{transform:translateX(5px)}
+.note{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:7px;
+ margin-top:18px;padding:9px 15px;border-radius:999px;font-size:12.5px;color:#98a0bd;
+ background:rgba(255,255,255,.05);border:1px solid var(--line)}
+.foot{position:relative;z-index:1;margin:16px 0 0;font-size:11px;color:#6e7593;letter-spacing:.05em}
+@media (max-width:420px){.card{padding:34px 22px 26px}h1{font-size:24px}.steps li{font-size:10px}}
+"""
 
 
 def page(title: str, msg: str, ok: bool) -> web.Response:
     cls = "ok" if ok else "no"
     mark = "✅" if ok else "❌"
+    eyebrow = "Verification Success" if ok else "Verification Failed"
     return web.Response(
-        text=f"<!doctype html><html lang=ko><head><meta charset=utf-8>"
-        f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{title}</title><style>{CSS}</style></head><body>"
-        f"<div class=card><h1 class={cls}>{mark} {title}</h1><p>{msg}</p>"
-        f"<p style='color:#888;font-size:13px'>창을 닫고 디스코드로 돌아가세요.</p></div>"
-        f"</body></html>",
+        text=(
+            "<!doctype html><html lang=ko><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<meta name=theme-color content='#0b0e1a'>"
+            f"<title>{html.escape(title)}</title><style>{CSS}</style></head><body>"
+            "<div class='orb a'></div><div class='orb b'></div><div class='stage'>"
+            f"<section class='card {cls}'>"
+            f"<div class='badge {cls}'>{mark}</div>"
+            f"<p class='eyebrow'>{eyebrow}</p>"
+            f"<h1>{html.escape(title)}</h1>"
+            "<div class='line'></div>"
+            f"<p class='msg {cls}'>{msg}</p>"
+            "<div class='note'>🔒 안전한 HTTPS 연결</div>"
+            "<p class='foot'>창을 닫고 디스코드로 돌아가세요</p>"
+            "</section></div></body></html>"
+        ),
         content_type="text/html",
     )
 
@@ -613,16 +686,27 @@ async def index(request: web.Request) -> web.Response:
         except Exception:
             pass
     title = html.escape(name) if name else "서버 인증"
-    visual = (
-        f"<img class=icon src='{icon}' alt=''>" if icon
-        else "<div class=lock>🔐</div>"
-    )
+    visual = f"<img src='{icon}' alt=''>" if icon else "🔐"
     return web.Response(
-        text=f"<!doctype html><html lang=ko><head><meta charset=utf-8>"
-        f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{title}</title><style>{CSS}</style></head><body>"
-        f"<div class=card>{visual}<h1>{title}</h1>"
-        f"<a class=btn href='{url}'>인증하기</a></div></body></html>",
+        text=(
+            "<!doctype html><html lang=ko><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<meta name=theme-color content='#0b0e1a'>"
+            f"<title>{title}</title><style>{CSS}</style></head><body>"
+            "<div class='orb a'></div><div class='orb b'></div><div class='stage'>"
+            "<section class='card'>"
+            f"<div class='badge'>{visual}</div>"
+            "<p class='eyebrow'>Discord Verification</p>"
+            f"<h1>{title}</h1>"
+            "<div class='line'></div>"
+            "<p class='msg'>본인 확인을 위해 아래 버튼을 눌러주세요.<br>"
+            "인증이 끝나면 바로 서버 활동을 시작할 수 있습니다.</p>"
+            "<ol class='steps'><li><b>1</b>인증 버튼</li>"
+            "<li><b>2</b>Discord 로그인</li><li><b>3</b>역할 지급</li></ol>"
+            f"<a class='btn' href='{url}'>인증하기 <span class='arrow'>→</span></a>"
+            "<div class='note'>🔒 Discord 공식 로그인 · 비밀번호를 요구하지 않습니다</div>"
+            "</section></div></body></html>"
+        ),
         content_type="text/html",
     )
 
@@ -722,7 +806,16 @@ async def callback(request: web.Request) -> web.Response:
             )
         )
         log.info("web verified: %s guild=%s", user_id, guild_id)
-        return page("인증 완료", "역할이 지급됐습니다. 즐거운 활동 되세요!", True)
+        # role_text 는 "<@&id> (역할명)" 형태 → 웹에는 역할명만 표시
+        role_label = role_text.split("(", 1)[1].rstrip(")") if "(" in role_text else ""
+        if role_label:
+            ok_msg = (
+                f"`{html.escape(role_label)}` 역할이 지급됐습니다.<br>"
+                "이제 서버의 모든 채널을 이용할 수 있어요."
+            )
+        else:
+            ok_msg = "역할이 지급됐습니다. 즐거운 활동 되세요!"
+        return page("인증 완료", ok_msg, True)
 
 
 async def health(_: web.Request) -> web.Response:
