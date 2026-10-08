@@ -247,6 +247,77 @@ def build_panel(
     return embed
 
 
+def build_panel_url(guild: discord.Guild, role: discord.Role) -> str:
+    """패널 버튼에 붙는 웹 인증 링크. 지급 역할이 바뀌면 이것도 다시 짜야 한다."""
+    base = webverify.env("WEB_PUBLIC_URL").rstrip("/")
+    gparam = f"&g={url_quote(guild.name[:50], safe='')}"
+    iparam = f"&i={guild.icon.key}" if guild.icon else ""
+    return f"{base}/?guild={guild.id}&role={role.id}{gparam}{iparam}"
+
+
+async def _locate_panel(
+    guild: discord.Guild, mid: int, hint_channel
+) -> discord.Message | None:
+    ch = None
+    if hint_channel:
+        try:
+            ch = guild.get_channel(int(hint_channel))
+        except (TypeError, ValueError):
+            ch = None
+    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+        try:
+            return await ch.fetch_message(mid)
+        except discord.HTTPException:
+            pass
+    # 구버전 패널은 채널 기록이 없다 → 텍스트 채널을 하나씩 뒤져서 찾는다.
+    for c in guild.text_channels[:40]:
+        try:
+            return await c.fetch_message(mid)
+        except discord.HTTPException:
+            continue
+    return None
+
+
+async def refresh_verify_panels(
+    guild: discord.Guild, role: discord.Role
+) -> tuple[int, int, int]:
+    """이 서버에 게시된 인증 패널 전부를 새 역할로 다시 쓴다.
+
+    임베드의 "인증하면 @역할 롤이 지급됩니다" 줄과, 버튼 URL 안의 role 파라미터
+    (웹에서 실제로 지급하는 역할)를 같이 바꾼다.
+    반환: (수정됨, 실패, 찾지못함)
+    """
+    panels = _load_json(PANEL_FILE)
+    ok = fail = missing = 0
+    changed = False
+    for mid_s, e in list(panels.items()):
+        if not isinstance(e, dict) or e.get("guild") != guild.id:
+            continue
+        try:
+            mid = int(mid_s)
+        except ValueError:
+            continue
+        msg = await _locate_panel(guild, mid, e.get("channel"))
+        if msg is None:
+            missing += 1
+            continue
+        embed = build_panel(role, e.get("title"), e.get("line1"), e.get("line2"))
+        try:
+            await msg.edit(
+                embed=embed, view=VerifyPanelView(build_panel_url(guild, role))
+            )
+        except discord.HTTPException:
+            fail += 1
+            continue
+        if e.get("channel") != msg.channel.id:
+            e["channel"] = msg.channel.id  # 채널 기록 백필
+            changed = True
+        ok += 1
+    if changed:
+        _save_json(PANEL_FILE, panels)
+    return ok, fail, missing
+
+
 # ---------- 이벤트 ----------
 @bot.event
 async def on_ready():
@@ -395,15 +466,13 @@ async def setup_panel(
         return
     # 랜딩 페이지를 거쳐 승인 → 스코프가 바뀌어도 기존 패널이 그대로 유효
     # 서버명/아이콘도 링크에 포함 (웹에서 API 조회 없이 표시)
-    base = webverify.env("WEB_PUBLIC_URL").rstrip("/")
-    gparam = f"&g={url_quote(guild.name[:50], safe='')}"
-    iparam = f"&i={guild.icon.key}" if guild.icon else ""
-    url = f"{base}/?guild={guild.id}&role={verified.id}{gparam}{iparam}"
+    url = build_panel_url(guild, verified)
     embed = build_panel(verified, 제목, 문장1, 문장2)
     msg = await target.send(embed=embed, view=VerifyPanelView(url))
     panels = _load_json(PANEL_FILE)
     panels[str(msg.id)] = {
         "guild": guild.id,
+        "channel": target.id,
         "verified": verified.id,
         "title": 제목,
         "line1": 문장1,
@@ -657,6 +726,87 @@ class RecoverConfirmView(discord.ui.View):
         await send_log(guild, f"🔑 **복구 실행** (by {interaction.user.mention})\n{summary}")
 
 
+class RecoverKeySetModal(discord.ui.Modal, title="복구키 직접 설정"):
+    key = discord.ui.TextInput(
+        label="사용할 복구키",
+        placeholder="예: ALPHA-2026-01 (영문/숫자/하이픈, 4~64자)",
+        required=True,
+        min_length=4,
+        max_length=64,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        raw = str(self.key.value).strip()
+        if not recover.valid_key(raw):
+            await interaction.response.send_message(
+                "❌ 영문·숫자·하이픈만 쓸 수 있고 4~64자여야 해요.", ephemeral=True
+            )
+            return
+        owner = recover.key_to_guild(raw)
+        if owner is not None and owner != guild.id:
+            await interaction.response.send_message(
+                "❌ 이미 다른 서버가 쓰는 복구키예요. 다른 값을 정해주세요.",
+                ephemeral=True,
+            )
+            return
+        old = recover.get_key(guild.id)
+        new = recover.set_key(guild.id, raw, interaction.user.id)
+        await interaction.response.send_message(
+            f"✅ 복구키를 `{new}` 로 바꿨어요."
+            + (f"\n이전 키 `{old}` 는 더 이상 쓸 수 없어요." if old else "")
+            + "\n쌓인 인원은 그대로 유지됩니다.",
+            ephemeral=True,
+        )
+
+
+class RecoverKeyDeleteView(discord.ui.View):
+    """복구키 삭제 확인 버튼 — 안내 메시지(ephemeral)에 붙는다."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        for cid, label, style, cb in (
+            ("verify:recover:delete_go", "🗑 삭제", discord.ButtonStyle.red, self._go),
+            ("verify:recover:delete_no", "취소", discord.ButtonStyle.secondary, self._no),
+        ):
+            b = discord.ui.Button(custom_id=cid, label=label, style=style)
+            b.callback = cb
+            self.add_item(b)
+
+    async def _go(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        key = recover.get_key(guild.id)
+        if key is None:
+            await interaction.response.edit_message(
+                content="🗑 이미 삭제된 키였어요.", embed=None, view=None
+            )
+            return
+        recover.delete_key(guild.id)
+        await interaction.response.edit_message(
+            content=(
+                f"🗑 복구키 `{key}` 를 삭제했어요.\n"
+                f"쌓인 인원은 남아 있으니 나중에 [✏️ 키 설정] 으로 키를 다시 만들면 이어집니다."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    async def _no(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            content="취소했어요.", embed=None, view=None
+        )
+
+
 class VerifyPanelView(discord.ui.View):
     """유저용 인증 패널 — [인증하기] 링크 버튼 하나뿐.
 
@@ -704,11 +854,34 @@ def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 
+async def _announce_panel_refresh(
+    interaction: discord.Interaction, guild: discord.Guild, role: discord.Role
+) -> None:
+    """게시된 인증 패널을 새 역할로 다시 쓰고, 몇 개 바꿨는지 알려준다.
+
+    관리패널 편집은 바로 끝내고(3초 규칙) 이쪽은 뒤에서 천천히 돌린다.
+    """
+    try:
+        ok, fail, missing = await refresh_verify_panels(guild, role)
+    except Exception:
+        log.exception("인증 패널 자동 갱신 실패")
+        return
+    bits = [f"🔄 게시된 인증 패널 **{ok}개**를 새 역할({role.mention})로 바꿨어요."]
+    if fail:
+        bits.append(f"수정 실패 {fail}개 (봇 권한 확인)")
+    if missing:
+        bits.append(f"찾을 수 없음 {missing}개 (삭제된 패널)")
+    try:
+        await interaction.followup.send(" ".join(bits), ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 class VerifyAdminView(discord.ui.View):
     """인증 관리 패널 — /인증관리 명령으로만 열리는 ephemeral 뷰.
 
     위 두 줄(RoleSelect)으로 지급/미인증 역할을 그자리에서 지정하고,
-    아래 버튼 5개로 인증 초기화·웹훅·복구를 다룬다.
+    아래 버튼 7개로 인증 초기화·웹훅·복구키·복구를 다룬다.
     custom_id 고정 → bot.add_view 로 영구 유지.
     채널에 게시되는 메시지에는 절대 붙지 않으므로 유저는 볼 수 없다.
     """
@@ -741,6 +914,10 @@ class VerifyAdminView(discord.ui.View):
              discord.ButtonStyle.red, self._webhook_clear, 2),
             ("verify:recover:key", "🔑 복구키 확인",
              discord.ButtonStyle.secondary, self._recover_key, 3),
+            ("verify:recover:set", "✏️ 키 설정",
+             discord.ButtonStyle.secondary, self._recover_key_set, 3),
+            ("verify:recover:delete", "🗑 키 삭제",
+             discord.ButtonStyle.red, self._recover_key_delete, 3),
             ("verify:recover:run", "♻️ 복구 실행",
              discord.ButtonStyle.green, self._recover_run, 3),
         ]
@@ -782,6 +959,8 @@ class VerifyAdminView(discord.ui.View):
         await interaction.response.edit_message(
             embed=verify_admin_embed(guild), view=VerifyAdminView()
         )
+        if kind == "verified":
+            await _announce_panel_refresh(interaction, guild, role)
 
     async def _on_verified_role(self, interaction: discord.Interaction) -> None:
         await self._set_role(interaction, "verified", True)
@@ -852,10 +1031,38 @@ class VerifyAdminView(discord.ui.View):
             return
         await interaction.response.send_modal(RecoverModal())
 
+    async def _recover_key_set(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(RecoverKeySetModal())
+
+    async def _recover_key_delete(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        key = recover.get_key(guild.id)
+        if key is None:
+            await interaction.response.send_message(
+                "ℹ️ 이 서버엔 등록된 복구키가 없어요.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"⚠️ 복구키 `{key}` 를 삭제할까요?\n"
+            f"• 그 키로는 더 이상 복구할 수 없어요.\n"
+            f"• 쌓인 인원은 남아 있으니 나중에 [✏️ 키 설정] 으로 키를 다시 만들면 그대로 이어져요.",
+            view=RecoverKeyDeleteView(),
+            ephemeral=True,
+        )
+
 
 # 뷰 클래스가 아래에 정의돼서 위쪽 add_view 블록에 못 넣는다 → 여기서 등록
 bot.add_view(VerifyAdminView())
 bot.add_view(RecoverConfirmView())
+bot.add_view(RecoverKeyDeleteView())
 
 
 

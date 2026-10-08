@@ -56,6 +56,61 @@ def key_to_guild(key: str) -> int | None:
         con.close()
 
 
+def get_key(guild_id: int) -> str | None:
+    """이 서버에 등록된 복구키. 없으면 None."""
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT key FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        con.close()
+
+
+def valid_key(key: str) -> bool:
+    """직접 입력한 키가 쓸 수 있는 형태인지. (영문/숫자/하이픈, 4~64자)"""
+    k = key.strip()
+    return 4 <= len(k) <= 64 and all(c.isalnum() or c == "-" for c in k)
+
+
+def set_key(guild_id: int, key: str, created_by: str) -> str:
+    """이 서버의 복구키를 직접 지정한 값으로 바꾼다. 정규화된 새 키를 돌려준다.
+
+    기존 키는 삭제되므로 그 키로는 복구할 수 없게 된다.
+    웹에 쌓인 인원은 guild 기준이라 그대로 남아 있다.
+    """
+    norm = key.strip().upper()
+    con = db()
+    try:
+        con.execute("DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),))
+        con.execute(
+            "INSERT INTO recovery_keys(guild_id, key, created_by, created_at)"
+            " VALUES(?,?,?,?)",
+            (str(guild_id), norm, str(created_by), int(time.time())),
+        )
+        con.commit()
+        return norm
+    finally:
+        con.close()
+
+
+def delete_key(guild_id: int) -> bool:
+    """이 서버의 복구키를 없앤다. 키가 사라지면 /복구 에서 쓸 수 없다.
+
+    쌓인 인원(토큰)은 guild 기준이라 남아 있으므로, 키를 다시 만들면 그대로 이어진다.
+    """
+    con = db()
+    try:
+        cur = con.execute(
+            "DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
+        )
+        con.commit()
+        return cur.rowcount > 0
+    finally:
+        con.close()
+
+
 async def backup_count(guild_id: int) -> int:
     """복구키에 쌓인 인원 (웹 API 경유)."""
     return await webapi.backup_count(guild_id)
