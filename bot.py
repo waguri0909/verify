@@ -142,21 +142,44 @@ def get_guild_roles(guild_id: int) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def set_guild_role(guild_id: int, kind: str, role_id: int | None) -> None:
-    """서버에 역할 하나를 지정/해제한다. (kind = verified / unverified)"""
+def _put_guild_setting(guild_id: int, key: str, value) -> None:
+    """서버 설정 하나를 넣는다. value 가 None 이면 지우고, 항목이 비면 제거."""
     data = _load_json(ROLES_FILE)
     g = data.get(str(guild_id))
     if not isinstance(g, dict):
         g = {}
-    if role_id is None:
-        g.pop(kind, None)
+    if value is None:
+        g.pop(key, None)
     else:
-        g[kind] = role_id
+        g[key] = value
     if g:
         data[str(guild_id)] = g
     else:
         data.pop(str(guild_id), None)
     _save_json(ROLES_FILE, data)
+
+
+def set_guild_role(guild_id: int, kind: str, role_id: int | None) -> None:
+    """서버에 역할 하나를 지정/해제한다. (kind = verified / unverified)"""
+    _put_guild_setting(guild_id, kind, role_id)
+
+
+def get_panel_color(guild_id: int) -> int:
+    """패널 왼쪽 바 색상. 아직 안 정했으면 기본 초록."""
+    raw = get_guild_roles(guild_id).get("panel_color")
+    if raw is None:
+        return DEFAULT_PANEL_COLOR
+    try:
+        return int(raw) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return DEFAULT_PANEL_COLOR
+
+
+def set_panel_color(guild_id: int, value: int | None) -> None:
+    """패널 왼쪽 바 색상 지정/초기화."""
+    _put_guild_setting(
+        guild_id, "panel_color", None if value is None else int(value) & 0xFFFFFF
+    )
 
 
 def _role_from(guild: discord.Guild, role_id) -> discord.Role | None:
@@ -225,22 +248,58 @@ async def send_log(guild: discord.Guild, text: str):
 DEFAULT_TITLE = "🔐 멤버 인증"
 DEFAULT_LINE1 = "서버에 오신 걸 환영합니다!"
 DEFAULT_LINE2 = "아래 **인증하기** 버튼을 눌러주세요.\n인증하면 나머지 채널이 보입니다."
+DEFAULT_PANEL_COLOR = 0x57F287  # 초록 — 기존 패널과 같은 색
+
+# 왼쪽 바 색상은 HEX 로도, 이름으로도 적을 수 있다.
+COLOR_NAMES = {
+    "green": 0x57F287, "그린": 0x57F287, "초록": 0x57F287,
+    "blue": 0x3498DB, "블루": 0x3498DB, "파랑": 0x3498DB, "파란": 0x3498DB,
+    "red": 0xED4245, "레드": 0xED4245, "빨강": 0xED4245, "빨간": 0xED4245,
+    "purple": 0x9B59B6, "퍼플": 0x9B59B6, "보라": 0x9B59B6,
+    "gold": 0xF1C40F, "골드": 0xF1C40F, "금색": 0xF1C40F,
+    "pink": 0xEB459E, "핑크": 0xEB459E, "분홍": 0xEB459E,
+    "orange": 0xE67E22, "오렌지": 0xE67E22, "주황": 0xE67E22,
+    "cyan": 0x1ABC9C, "시안": 0x1ABC9C, "청록": 0x1ABC9C,
+    "white": 0xFFFFFF, "화이트": 0xFFFFFF, "흰색": 0xFFFFFF,
+    "black": 0x000000, "블랙": 0x000000, "검정": 0x000000,
+    "gray": 0x95A5A6, "grey": 0x95A5A6, "회색": 0x95A5A6,
+}
+
+
+def parse_color(raw: str) -> int | None:
+    """'#57F287' / '57F287' / '#abc' / '그린' → 0xRRGGBB. 못 읽으면 None."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.startswith("#"):
+        s = s[1:]
+    elif s[:2].lower() == "0x":
+        s = s[2:]
+    named = COLOR_NAMES.get(s.lower())
+    if named is not None:
+        return named
+    if len(s) == 3 and all(c in "0123456789abcdefABCDEF" for c in s):
+        s = "".join(c * 2 for c in s)
+    if len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s):
+        return int(s, 16)
+    return None
 
 
 def build_panel(
-    role: discord.Role | None = None,
     title: str | None = None,
     line1: str | None = None,
     line2: str | None = None,
+    color: int | None = None,
 ) -> discord.Embed:
+    """유저용 인증 패널 임베드. (지급 역할 문구는 넣지 않는다)"""
     title = (title or DEFAULT_TITLE)[:200]
     line1 = (line1 or DEFAULT_LINE1)[:1000]
     line2 = (line2 or DEFAULT_LINE2)[:1500]
-    role_line = f"\n인증하면 {role.mention} 롤이 지급됩니다." if role else ""
+    value = (color if color is not None else DEFAULT_PANEL_COLOR) & 0xFFFFFF
     embed = discord.Embed(
         title=title,
-        description=f"{line1}\n\n{line2}{role_line}",
-        color=discord.Color.green(),
+        description=f"{line1}\n\n{line2}",
+        color=discord.Color(value),
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(text="문의: 서버 관리자")
@@ -279,15 +338,17 @@ async def _locate_panel(
 
 
 async def refresh_verify_panels(
-    guild: discord.Guild, role: discord.Role
+    guild: discord.Guild, role: discord.Role | None = None
 ) -> tuple[int, int, int]:
-    """이 서버에 게시된 인증 패널 전부를 새 역할로 다시 쓴다.
+    """이 서버에 게시된 인증 패널 전부를 다시 쓴다.
 
-    임베드의 "인증하면 @역할 롤이 지급됩니다" 줄과, 버튼 URL 안의 role 파라미터
-    (웹에서 실제로 지급하는 역할)를 같이 바꾼다.
+    패널 문구(역할 줄은 이제 없음)와 왼쪽 바 색상을 새로 그리고,
+    role 을 주면 버튼 URL 안의 role 파라미터도 같이 바꾼다.
+    role 을 못 찾았을 땐 URL 은 건드리지 않고 임베드만 고친다.
     반환: (수정됨, 실패, 찾지못함)
     """
     panels = _load_json(PANEL_FILE)
+    color = get_panel_color(guild.id)
     ok = fail = missing = 0
     changed = False
     for mid_s, e in list(panels.items()):
@@ -301,11 +362,14 @@ async def refresh_verify_panels(
         if msg is None:
             missing += 1
             continue
-        embed = build_panel(role, e.get("title"), e.get("line1"), e.get("line2"))
+        embed = build_panel(e.get("title"), e.get("line1"), e.get("line2"), color)
         try:
-            await msg.edit(
-                embed=embed, view=VerifyPanelView(build_panel_url(guild, role))
-            )
+            if role is None:
+                await msg.edit(embed=embed)
+            else:
+                await msg.edit(
+                    embed=embed, view=VerifyPanelView(build_panel_url(guild, role))
+                )
         except discord.HTTPException:
             fail += 1
             continue
@@ -319,8 +383,26 @@ async def refresh_verify_panels(
 
 
 # ---------- 이벤트 ----------
+_PANEL_REFRESH_DONE = False
+
+
+async def _refresh_all_panels() -> None:
+    """서버에 게시된 인증 패널을 지금 규칙(역할 문구 제거·바 색상·버튼 URL)으로 다시 그린다."""
+    for g in list(bot.guilds):
+        try:
+            ok, fail, missing = await refresh_verify_panels(
+                g, resolve_verified_role(g)
+            )
+        except Exception:
+            log.exception("패널 갱신 실패 guild=%s", getattr(g, "id", "?"))
+            continue
+        if ok or fail or missing:
+            log.info("패널 갱신 guild=%s ok=%s fail=%s miss=%s", g.id, ok, fail, missing)
+
+
 @bot.event
 async def on_ready():
+    global _PANEL_REFRESH_DONE
     errors = config.validate()
     if os.getenv("DISABLE_WEB", "").lower() not in ("1", "true", "yes"):
         errors += webverify.validate()  # 봇 전용 모드에서는 웹 키 불필요
@@ -336,6 +418,11 @@ async def on_ready():
         log.info("슬래시 명령 동기화 완료 (전역, 최대 1시간 내 반영)")
     except Exception as e:
         log.exception("슬래시 명령 동기화 실패: %s", e)
+    # 재접속 때마다 도는 걸 막기 위한 한 번만 플래그.
+    # 패널 양식(역할 문구 제거·색상)이 배포 직후 바로 반영되게 한다.
+    if not _PANEL_REFRESH_DONE:
+        _PANEL_REFRESH_DONE = True
+        await _refresh_all_panels()
 
 
 @bot.event
@@ -415,6 +502,7 @@ async def on_member_remove(member: discord.Member):
     제목="패널 제목 (비우면 기본값)",
     문장1="맨 위 문장: 환영 문구 (비우면 기본값)",
     문장2="아래 블록 전체 (버튼 안내+채널 안내, 비우면 기본값)",
+    색상="패널 왼쪽 바 색상 (예: #57F287 또는 그린·블루, 비우면 현재 설정 유지)",
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setup_panel(
@@ -424,6 +512,7 @@ async def setup_panel(
     제목: str | None = None,
     문장1: str | None = None,
     문장2: str | None = None,
+    색상: str | None = None,
 ):
     target = 채널 or interaction.channel
     if isinstance(target, discord.Thread):
@@ -453,6 +542,20 @@ async def setup_panel(
             ephemeral=True,
         )
         return
+    color = get_panel_color(guild.id)
+    color_set = False
+    if 색상 is not None:
+        parsed = parse_color(색상)
+        if parsed is None:
+            await interaction.response.send_message(
+                "❌ 색상을 못 읽어요. `#57F287` 처럼 HEX 6자리, "
+                "또는 그린/블루/레드 같은 색 이름으로 적어주세요.",
+                ephemeral=True,
+            )
+            return
+        set_panel_color(guild.id, parsed)
+        color = parsed
+        color_set = True
     # Discord 는 최초 응답에 3초만 준다. 그 안에 답 못하면
     # 10062 Unknown interaction 으로 응답이 통째로 버려진다.
     await interaction.response.defer(ephemeral=True)
@@ -467,7 +570,7 @@ async def setup_panel(
     # 랜딩 페이지를 거쳐 승인 → 스코프가 바뀌어도 기존 패널이 그대로 유효
     # 서버명/아이콘도 링크에 포함 (웹에서 API 조회 없이 표시)
     url = build_panel_url(guild, verified)
-    embed = build_panel(verified, 제목, 문장1, 문장2)
+    embed = build_panel(제목, 문장1, 문장2, color)
     msg = await target.send(embed=embed, view=VerifyPanelView(url))
     panels = _load_json(PANEL_FILE)
     panels[str(msg.id)] = {
@@ -482,9 +585,11 @@ async def setup_panel(
     # → 패널 메시지를 지워도 /인증관리 와 입장 로그가 같은 역할을 쓴다.
     set_guild_role(guild.id, "verified", verified.id)
     _save_json(PANEL_FILE, panels)
+    extra = f"패널 색상: `#{color:06X}`\n" if color_set else ""
     await interaction.followup.send(
         f"{target.mention}에 인증 패널을 올렸어요. ✅\n"
         f"지급 역할: {verified.mention}\n"
+        f"{extra}"
         f"관리 메뉴는 **/인증관리** 로 열 수 있어요.",
         ephemeral=True,
     )
@@ -835,6 +940,9 @@ def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(
         name="미인증 역할", value=unverified.mention if unverified else "미지정", inline=True
     )
+    embed.add_field(
+        name="패널 색상", value=f"**#{get_panel_color(guild.id):06X}**", inline=True
+    )
     missing = [
         label
         for label, r in (("지급", verified), ("미인증", unverified))
@@ -855,9 +963,12 @@ def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
 
 
 async def _announce_panel_refresh(
-    interaction: discord.Interaction, guild: discord.Guild, role: discord.Role
+    interaction: discord.Interaction,
+    guild: discord.Guild,
+    what: str,
+    role: discord.Role | None = None,
 ) -> None:
-    """게시된 인증 패널을 새 역할로 다시 쓰고, 몇 개 바꿨는지 알려준다.
+    """게시된 인증 패널을 다시 쓰고, 몇 개 바꿨는지 알려준다.
 
     관리패널 편집은 바로 끝내고(3초 규칙) 이쪽은 뒤에서 천천히 돌린다.
     """
@@ -866,7 +977,7 @@ async def _announce_panel_refresh(
     except Exception:
         log.exception("인증 패널 자동 갱신 실패")
         return
-    bits = [f"🔄 게시된 인증 패널 **{ok}개**를 새 역할({role.mention})로 바꿨어요."]
+    bits = [f"🔄 게시된 인증 패널 **{ok}개**가 {what} 바뀌었어요."]
     if fail:
         bits.append(f"수정 실패 {fail}개 (봇 권한 확인)")
     if missing:
@@ -877,11 +988,56 @@ async def _announce_panel_refresh(
         pass
 
 
+async def _apply_panel_color(
+    interaction: discord.Interaction, guild: discord.Guild, value: int | None
+) -> None:
+    """패널 바 색상 저장 → 관리패널 갱신 → 채널에 게시된 패널에도 바로 반영."""
+    set_panel_color(guild.id, value)
+    shown = get_panel_color(guild.id)
+    await interaction.response.edit_message(
+        embed=verify_admin_embed(guild), view=VerifyAdminView()
+    )
+    await _announce_panel_refresh(
+        interaction, guild, f"색상 `#{shown:06X}`(으)로", resolve_verified_role(guild)
+    )
+
+
+class PanelColorModal(discord.ui.Modal, title="인증 패널 색상"):
+    color = discord.ui.TextInput(
+        label="색상 (HEX 또는 색 이름)",
+        placeholder="예: #57F287 · 그린 · 블루 · 1ABC9C · 기본",
+        required=True,
+        max_length=32,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        raw = str(self.color.value).strip()
+        if raw in ("기본", "없음", "초기화", "default", "none", "reset"):
+            value = None
+        else:
+            value = parse_color(raw)
+            if value is None:
+                await interaction.response.send_message(
+                    "❌ 색상을 못 읽어요. `#57F287` 처럼 HEX 6자리, "
+                    "또는 그린/블루/레드 같은 색 이름으로 적어주세요.",
+                    ephemeral=True,
+                )
+                return
+        await _apply_panel_color(interaction, guild, value)
+
+
 class VerifyAdminView(discord.ui.View):
     """인증 관리 패널 — /인증관리 명령으로만 열리는 ephemeral 뷰.
 
     위 두 줄(RoleSelect)으로 지급/미인증 역할을 그자리에서 지정하고,
-    아래 버튼 7개로 인증 초기화·웹훅·복구키·복구를 다룬다.
+    버튼으로 인증 초기화·웹훅·복구키·패널 색상을 다룬다.
+    (마지막 줄 = 패널 왼쪽 바 색상 프리셋/직접 입력)
     custom_id 고정 → bot.add_view 로 영구 유지.
     채널에 게시되는 메시지에는 절대 붙지 않으므로 유저는 볼 수 없다.
     """
@@ -920,6 +1076,17 @@ class VerifyAdminView(discord.ui.View):
              discord.ButtonStyle.red, self._recover_key_delete, 3),
             ("verify:recover:run", "♻️ 복구 실행",
              discord.ButtonStyle.green, self._recover_run, 3),
+            # 4행: 패널 왼쪽 바 색상
+            ("verify:color:open", "🎨 색상 설정",
+             discord.ButtonStyle.secondary, self._color_open, 4),
+            ("verify:color:green", "🟢 그린",
+             discord.ButtonStyle.success, self._color_green, 4),
+            ("verify:color:blue", "🔵 블루",
+             discord.ButtonStyle.primary, self._color_blue, 4),
+            ("verify:color:purple", "🟣 퍼플",
+             discord.ButtonStyle.primary, self._color_purple, 4),
+            ("verify:color:red", "🔴 레드",
+             discord.ButtonStyle.danger, self._color_red, 4),
         ]
         for cid, label, style, cb, row in specs:
             b = discord.ui.Button(custom_id=cid, label=label, style=style, row=row)
@@ -960,13 +1127,43 @@ class VerifyAdminView(discord.ui.View):
             embed=verify_admin_embed(guild), view=VerifyAdminView()
         )
         if kind == "verified":
-            await _announce_panel_refresh(interaction, guild, role)
+            await _announce_panel_refresh(
+                interaction, guild, f"새 역할({role.mention})으로", role
+            )
 
     async def _on_verified_role(self, interaction: discord.Interaction) -> None:
         await self._set_role(interaction, "verified", True)
 
     async def _on_unverified_role(self, interaction: discord.Interaction) -> None:
         await self._set_role(interaction, "unverified", False)
+
+    # --- 패널 왼쪽 바 색상 ---
+    async def _set_color(self, interaction: discord.Interaction, value: int) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        await _apply_panel_color(interaction, guild, value)
+
+    async def _color_open(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(PanelColorModal())
+
+    async def _color_green(self, interaction: discord.Interaction) -> None:
+        await self._set_color(interaction, COLOR_NAMES["green"])
+
+    async def _color_blue(self, interaction: discord.Interaction) -> None:
+        await self._set_color(interaction, COLOR_NAMES["blue"])
+
+    async def _color_purple(self, interaction: discord.Interaction) -> None:
+        await self._set_color(interaction, COLOR_NAMES["purple"])
+
+    async def _color_red(self, interaction: discord.Interaction) -> None:
+        await self._set_color(interaction, COLOR_NAMES["red"])
 
     async def _reset(self, interaction: discord.Interaction) -> None:
         if not _verify_admin_ok(interaction):
