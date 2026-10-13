@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 import joinleave
 import recover
 import ticket
+from colors import COLOR_NAMES, HEX_HINT, parse_color
 import webapi
 import webverify
 
@@ -250,40 +251,6 @@ DEFAULT_LINE1 = "서버에 오신 걸 환영합니다!"
 DEFAULT_LINE2 = "아래 **인증하기** 버튼을 눌러주세요.\n인증하면 나머지 채널이 보입니다."
 DEFAULT_PANEL_COLOR = 0x57F287  # 초록 — 기존 패널과 같은 색
 
-# 왼쪽 바 색상은 HEX 로도, 이름으로도 적을 수 있다.
-COLOR_NAMES = {
-    "green": 0x57F287, "그린": 0x57F287, "초록": 0x57F287,
-    "blue": 0x3498DB, "블루": 0x3498DB, "파랑": 0x3498DB, "파란": 0x3498DB,
-    "red": 0xED4245, "레드": 0xED4245, "빨강": 0xED4245, "빨간": 0xED4245,
-    "purple": 0x9B59B6, "퍼플": 0x9B59B6, "보라": 0x9B59B6,
-    "gold": 0xF1C40F, "골드": 0xF1C40F, "금색": 0xF1C40F,
-    "pink": 0xEB459E, "핑크": 0xEB459E, "분홍": 0xEB459E,
-    "orange": 0xE67E22, "오렌지": 0xE67E22, "주황": 0xE67E22,
-    "cyan": 0x1ABC9C, "시안": 0x1ABC9C, "청록": 0x1ABC9C,
-    "white": 0xFFFFFF, "화이트": 0xFFFFFF, "흰색": 0xFFFFFF,
-    "black": 0x000000, "블랙": 0x000000, "검정": 0x000000,
-    "gray": 0x95A5A6, "grey": 0x95A5A6, "회색": 0x95A5A6,
-}
-
-
-def parse_color(raw: str) -> int | None:
-    """'#57F287' / '57F287' / '#abc' / '그린' → 0xRRGGBB. 못 읽으면 None."""
-    s = (raw or "").strip()
-    if not s:
-        return None
-    if s.startswith("#"):
-        s = s[1:]
-    elif s[:2].lower() == "0x":
-        s = s[2:]
-    named = COLOR_NAMES.get(s.lower())
-    if named is not None:
-        return named
-    if len(s) == 3 and all(c in "0123456789abcdefABCDEF" for c in s):
-        s = "".join(c * 2 for c in s)
-    if len(s) == 6 and all(c in "0123456789abcdefABCDEF" for c in s):
-        return int(s, 16)
-    return None
-
 
 def build_panel(
     title: str | None = None,
@@ -300,9 +267,7 @@ def build_panel(
         title=title,
         description=f"{line1}\n\n{line2}",
         color=discord.Color(value),
-        timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text="문의: 서버 관리자")
     return embed
 
 
@@ -387,17 +352,23 @@ _PANEL_REFRESH_DONE = False
 
 
 async def _refresh_all_panels() -> None:
-    """서버에 게시된 인증 패널을 지금 규칙(역할 문구 제거·바 색상·버튼 URL)으로 다시 그린다."""
+    """서버에 게시된 인증/티켓 패널을 지금 규칙(footer·시각 제거, 색상, 버튼)으로 다시 그린다."""
     for g in list(bot.guilds):
-        try:
-            ok, fail, missing = await refresh_verify_panels(
-                g, resolve_verified_role(g)
-            )
-        except Exception:
-            log.exception("패널 갱신 실패 guild=%s", getattr(g, "id", "?"))
-            continue
-        if ok or fail or missing:
-            log.info("패널 갱신 guild=%s ok=%s fail=%s miss=%s", g.id, ok, fail, missing)
+        jobs = (
+            ("인증", lambda gg=g: refresh_verify_panels(gg, resolve_verified_role(gg))),
+            ("티켓", lambda gg=g: ticket.refresh_panels(gg)),
+        )
+        for name, job in jobs:
+            try:
+                ok, fail, missing = await job()
+            except Exception:
+                log.exception("%s 패널 갱신 실패 guild=%s", name, getattr(g, "id", "?"))
+                continue
+            if ok or fail or missing:
+                log.info(
+                    "%s 패널 갱신 guild=%s ok=%s fail=%s miss=%s",
+                    name, g.id, ok, fail, missing,
+                )
 
 
 @bot.event
@@ -932,7 +903,6 @@ def verify_admin_embed(guild: discord.Guild) -> discord.Embed:
         title="🛠️ 인증 관리",
         description="위 드롭다운으로 역할을 지정하고, 아래 버튼으로 인증을 관리해요.",
         color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
         name="지급 역할", value=verified.mention if verified else "미지정", inline=True
@@ -1272,6 +1242,15 @@ bot.add_view(RecoverKeyDeleteView())
     설명="패널 안내 문구 (비우면 기본값)",
     역할="티켓 스태프 역할 (지정하면 티켓 설정에도 저장)",
     카테고리="티켓이 생성될 카테고리 (지정하면 티켓 설정에도 저장)",
+    색상="패널 왼쪽 바 색상 (예: #6366F1 또는 인디고, 비우면 현재 설정 유지)",
+    버튼="패널에 보여줄 버튼 (비우면 현재 설정 유지)",
+)
+@app_commands.choices(
+    버튼=[
+        app_commands.Choice(name="둘 다", value="both"),
+        app_commands.Choice(name="💳 결제 문의만", value="purchase"),
+        app_commands.Choice(name="💬 일반·파트너 문의만", value="general"),
+    ]
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ticket_panel(
@@ -1281,6 +1260,8 @@ async def ticket_panel(
     설명: str | None = None,
     역할: discord.Role | None = None,
     카테고리: discord.abc.GuildChannel | None = None,
+    색상: str | None = None,
+    버튼: str | None = None,
 ):
     target = 채널 or interaction.channel
     if isinstance(target, discord.Thread):
@@ -1302,6 +1283,16 @@ async def ticket_panel(
             ephemeral=True,
         )
         return
+    if 색상 is not None:
+        value = parse_color(색상)
+        if value is None:
+            await interaction.response.send_message(
+                f"❌ 색상을 못 읽어요. {HEX_HINT}로 적어주세요.", ephemeral=True
+            )
+            return
+        ticket.set_color(guild.id, value)
+    if 버튼 is not None:
+        ticket.set_button_mode(guild.id, 버튼)
     updates = {}
     if 역할 is not None:
         updates["staff"] = 역할.id
@@ -1311,11 +1302,14 @@ async def ticket_panel(
         ticket.update_settings(guild.id, **updates)
     await interaction.response.defer(ephemeral=True)
     try:
-        msg = await target.send(embed=ticket.build_panel(제목, 설명), view=ticket.PanelView())
+        msg = await target.send(
+            embed=ticket.build_panel(제목, 설명, guild.id),
+            view=ticket.PanelView(ticket.button_mode(guild.id)),
+        )
     except discord.HTTPException as e:
         await interaction.followup.send(f"❌ 패널 게시 실패: {e}", ephemeral=True)
         return
-    ticket.save_panel(msg.id, guild.id)
+    ticket.save_panel(msg.id, guild.id, target.id)
     await interaction.followup.send(
         f"{target.mention}에 티켓 패널을 올렸어요. ✅\n"
         f"{ticket.settings_summary(guild.id)}\n"

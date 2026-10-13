@@ -18,6 +18,8 @@ from pathlib import Path
 
 import discord
 
+from colors import COLOR_NAMES, DEFAULT_TICKET_COLOR, HEX_HINT, parse_color
+
 log = logging.getLogger("ticket")
 
 BASE_DIR = Path(__file__).parent
@@ -76,6 +78,8 @@ def _settings_of(data: dict, guild_id: int) -> dict:
     g.setdefault("category", None)   # 티켓 생성 카테고리 ID
     g.setdefault("reason", True)     # 사유 입력 모달 on/off
     g.setdefault("counter", 0)       # 마지막 발급 번호
+    g.setdefault("color", None)      # 패널 왼쪽 바 색상 (None = 기본 인디고)
+    g.setdefault("buttons", "both")  # 패널 버튼: both / purchase / general
     return g
 
 
@@ -97,9 +101,54 @@ def update_settings(guild_id: int, **fields) -> dict:
     return g
 
 
-def save_panel(message_id: int, guild_id: int) -> None:
+# ---------- 패널 색상 / 노출 버튼 ----------
+DEFAULT_COLOR = DEFAULT_TICKET_COLOR  # 인디고
+
+BUTTON_LABELS = {
+    "both": "둘 다",
+    "purchase": "💳 결제 문의만",
+    "general": "💬 일반·파트너 문의만",
+}
+
+
+def get_color(guild_id: int) -> int:
+    """패널 왼쪽 바 색상. 아직 안 정했으면 기본 인디고."""
+    raw = guild_settings(guild_id).get("color")
+    if raw is None:
+        return DEFAULT_COLOR
+    try:
+        return int(raw) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return DEFAULT_COLOR
+
+
+def set_color(guild_id: int, value: int | None) -> dict:
+    return update_settings(
+        guild_id, color=None if value is None else int(value) & 0xFFFFFF
+    )
+
+
+def button_mode(guild_id: int) -> str:
+    mode = guild_settings(guild_id).get("buttons")
+    return mode if mode in BUTTON_LABELS else "both"
+
+
+def set_button_mode(guild_id: int, mode: str) -> dict:
+    return update_settings(guild_id, buttons=mode if mode in BUTTON_LABELS else "both")
+
+
+def button_label(mode: str) -> str:
+    return BUTTON_LABELS.get(mode, BUTTON_LABELS["both"])
+
+
+def save_panel(message_id: int, guild_id: int, channel_id: int | None = None) -> None:
     data = _load()
-    data["panels"][str(message_id)] = {"guild": guild_id}
+    rec = data["panels"].get(str(message_id))
+    rec = rec if isinstance(rec, dict) else {}
+    rec["guild"] = guild_id
+    if channel_id is not None:
+        rec["channel"] = channel_id
+    data["panels"][str(message_id)] = rec
     _save(data)
 
 
@@ -207,6 +256,86 @@ def prune_missing(guild: discord.Guild) -> int:
     return len(dead)
 
 
+# ---------- 게시된 티켓 패널 갱신 (색상·버튼 조합 변경 시) ----------
+async def _locate_panel(guild: discord.Guild, message_id: int, channel_id):
+    """기록된 채널부터 찾고, 없으면 서버 텍스트 채널을 하나씩 훑는다."""
+    ch = guild.get_channel(_as_int(channel_id)) if channel_id else None
+    if isinstance(ch, discord.TextChannel):
+        try:
+            return await ch.fetch_message(message_id)
+        except discord.HTTPException:
+            pass
+    for ch in guild.text_channels:
+        try:
+            return await ch.fetch_message(message_id)
+        except discord.HTTPException:
+            continue
+    return None
+
+
+def _restyle(msg: discord.Message, color: int) -> discord.Embed:
+    """게시된 메시지 문구는 그대로 두고 색만 바꾼다 (오래된 footer/시각도 지운다)."""
+    if not msg.embeds:
+        return build_panel(color=color)
+    embed = msg.embeds[0]
+    embed.color = discord.Color(color)
+    embed.remove_footer()
+    embed.timestamp = None
+    return embed
+
+
+async def refresh_panels(guild: discord.Guild) -> tuple[int, int, int]:
+    """이 서버에 게시된 티켓 패널 전부를 지금 설정(색상·노출 버튼)으로 다시 쓴다."""
+    mode = button_mode(guild.id)
+    color = get_color(guild.id)
+    view = PanelView(mode)
+    ok = fail = missing = 0
+    for mid_s, rec in list(_load()["panels"].items()):
+        if not isinstance(rec, dict) or rec.get("guild") != guild.id:
+            continue
+        mid = _as_int(mid_s)
+        if mid is None:
+            continue
+        msg = await _locate_panel(guild, mid, rec.get("channel"))
+        if msg is None:
+            missing += 1
+            continue
+        cid = getattr(getattr(msg, "channel", None), "id", None)
+        if rec.get("channel") != cid:
+            save_panel(mid, guild.id, cid)  # 채널 위치 백필 → 다음엔 바로 찾는다
+        try:
+            await msg.edit(embed=_restyle(msg, color), view=view)
+        except discord.HTTPException:
+            fail += 1
+            continue
+        ok += 1
+    return ok, fail, missing
+
+
+async def announce_panel_refresh(
+    interaction: discord.Interaction, guild: discord.Guild
+) -> None:
+    """게시된 티켓 패널 몇 개를 바꿨는지 사용자에게 알려준다."""
+    try:
+        ok, fail, missing = await refresh_panels(guild)
+    except Exception:
+        log.exception("티켓 패널 자동 갱신 실패 guild=%s", guild.id)
+        return
+    bits = [
+        f"🔄 게시된 티켓 패널 **{ok}개**를 "
+        f"버튼 {button_label(button_mode(guild.id))} / 색상 "
+        f"`#{get_color(guild.id):06X}` (으)로 바꿨어요."
+    ]
+    if fail:
+        bits.append(f"수정 실패 {fail}개 (봇 권한 확인)")
+    if missing:
+        bits.append(f"찾을 수 없음 {missing}개 (삭제된 패널)")
+    try:
+        await interaction.followup.send(" ".join(bits), ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 def _as_int(v) -> int | None:
     try:
         return int(v)
@@ -240,19 +369,24 @@ def settings_summary(guild_id: int) -> str:
         f"• 스태프 역할: {staff}\n"
         f"• 티켓 카테고리: {cat}\n"
         f"• 사유 입력창: **{reason}**\n"
+        f"• 패널 버튼: **{button_label(button_mode(guild_id))}**\n"
+        f"• 패널 색상: `#{get_color(guild_id):06X}`\n"
         f"• 발급된 티켓: **{int(s.get('counter', 0))}개**\n"
         f"• 게시된 패널: **{panel_count(guild_id)}개**"
     )
 
 
-def build_panel(title: str | None = None, desc: str | None = None) -> discord.Embed:
-    embed = discord.Embed(
+def build_panel(
+    title: str | None = None,
+    desc: str | None = None,
+    guild_id: int | None = None,
+) -> discord.Embed:
+    color = get_color(guild_id) if guild_id is not None else DEFAULT_COLOR
+    return discord.Embed(
         title=(title or DEFAULT_TITLE)[:200],
         description=(desc or DEFAULT_DESC)[:2000],
-        color=discord.Color.from_rgb(99, 102, 241),
-        timestamp=datetime.now(timezone.utc),
+        color=discord.Color(color),
     )
-    return embed
 
 
 # ---------- 티켓 관리 (패널의 [⚙️ 티켓 관리] 버튼 → ephemeral 조작판) ----------
@@ -273,11 +407,16 @@ def admin_embed(guild_id: int) -> discord.Embed:
         title="⚙️ 티켓 관리",
         description="아래에서 티켓 설정을 바로바로 바꿀 수 있어요.",
         color=discord.Color.from_rgb(99, 102, 241),
-        timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="스태프 역할", value=staff, inline=True)
     embed.add_field(name="티켓 카테고리", value=cat, inline=True)
     embed.add_field(name="사유 입력창", value=reason, inline=True)
+    embed.add_field(
+        name="패널 버튼", value=f"**{button_label(button_mode(guild_id))}**", inline=True
+    )
+    embed.add_field(
+        name="패널 색상", value=f"**#{get_color(guild_id):06X}**", inline=True
+    )
     embed.add_field(name="발급된 티켓", value=f"{int(s.get('counter', 0))}개", inline=True)
     embed.add_field(name="게시된 패널", value=f"{panel_count(guild_id)}개", inline=True)
     return embed
@@ -312,22 +451,45 @@ class TicketAdminView(discord.ui.View):
 
         for cid, label, style, cb in (
             ("ticket:admin:reason_on", "사유 입력창 켜기",
-             discord.ButtonStyle.green, self._on_reason_on),
+             discord.ButtonStyle.success, self._on_reason_on),
             ("ticket:admin:reason_off", "사유 입력창 끄기",
-             discord.ButtonStyle.red, self._on_reason_off),
+             discord.ButtonStyle.danger, self._on_reason_off),
+            ("ticket:admin:clear", "역할·카테고리 해제",
+             discord.ButtonStyle.secondary, self._on_clear),
+            ("ticket:admin:reset", "번호 초기화",
+             discord.ButtonStyle.secondary, self._on_reset),
         ):
             b = discord.ui.Button(custom_id=cid, label=label, style=style, row=2)
             b.callback = cb
             self.add_item(b)
 
-        for cid, label, cb in (
-            ("ticket:admin:clear", "역할·카테고리 해제", self._on_clear),
-            ("ticket:admin:reset", "번호 초기화", self._on_reset),
+        # 3행: 유저 패널에 보여줄 버튼 조합
+        for cid, label, style, cb in (
+            ("ticket:admin:btn_both", "👋 둘 다",
+             discord.ButtonStyle.secondary, self._on_btn_both),
+            ("ticket:admin:btn_purchase", "💳 결제 문의만",
+             discord.ButtonStyle.blurple, self._on_btn_purchase),
+            ("ticket:admin:btn_general", "💬 일반·파트너만",
+             discord.ButtonStyle.secondary, self._on_btn_general),
         ):
-            b = discord.ui.Button(
-                custom_id=cid, label=label,
-                style=discord.ButtonStyle.secondary, row=3,
-            )
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=3)
+            b.callback = cb
+            self.add_item(b)
+
+        # 4행: 유저 패널 왼쪽 바 색상
+        for cid, label, style, cb in (
+            ("ticket:admin:color_open", "🎨 색상 설정",
+             discord.ButtonStyle.secondary, self._on_color_open),
+            ("ticket:admin:color_default", "🟣 기본",
+             discord.ButtonStyle.secondary, self._on_color_default),
+            ("ticket:admin:color_blue", "🔵 블루",
+             discord.ButtonStyle.primary, self._on_color_blue),
+            ("ticket:admin:color_green", "🟢 그린",
+             discord.ButtonStyle.success, self._on_color_green),
+            ("ticket:admin:color_red", "🔴 레드",
+             discord.ButtonStyle.danger, self._on_color_red),
+        ):
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=4)
             b.callback = cb
             self.add_item(b)
 
@@ -364,13 +526,44 @@ class TicketAdminView(discord.ui.View):
     async def _on_reset(self, interaction: discord.Interaction) -> None:
         await self._apply(interaction, counter=0)
 
+    # --- 유저 패널에 보여줄 버튼 조합 ---
+    async def _on_btn_both(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, buttons="both")
+
+    async def _on_btn_purchase(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, buttons="purchase")
+
+    async def _on_btn_general(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, buttons="general")
+
+    # --- 유저 패널 왼쪽 바 색상 ---
+    async def _on_color_open(self, interaction: discord.Interaction) -> None:
+        if not can_admin(interaction):
+            await self._deny(interaction)
+            return
+        await interaction.response.send_modal(TicketColorModal())
+
+    async def _on_color_default(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, color=None)
+
+    async def _on_color_blue(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, color=COLOR_NAMES["blue"])
+
+    async def _on_color_green(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, color=COLOR_NAMES["green"])
+
+    async def _on_color_red(self, interaction: discord.Interaction) -> None:
+        await self._apply(interaction, refresh=True, color=COLOR_NAMES["red"])
+
     # --- 공통 ---
     async def _deny(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
         )
 
-    async def _apply(self, interaction: discord.Interaction, **fields) -> None:
+    async def _apply(
+        self, interaction: discord.Interaction, *, refresh: bool = False, **fields
+    ) -> None:
         guild = interaction.guild
         if guild is None:
             return
@@ -379,9 +572,48 @@ class TicketAdminView(discord.ui.View):
             return
         update_settings(guild.id, **fields)
         prune_missing(guild)
+        # 응답부터 끝내고(3초 규칙) 패널 갱신은 뒤에서 천천히 돌린다.
         await interaction.response.edit_message(
             embed=admin_embed(guild.id), view=TicketAdminView()
         )
+        if refresh:
+            await announce_panel_refresh(interaction, guild)
+
+
+# ---------- 색상 입력 모달 ----------
+class TicketColorModal(discord.ui.Modal, title="티켓 패널 색상"):
+    color = discord.ui.TextInput(
+        label="색상 (HEX 또는 색 이름)",
+        placeholder="예: #6366F1 · 인디고 · 블루 · 1ABC9C · 기본",
+        required=True,
+        max_length=32,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not can_admin(interaction):
+            await interaction.response.send_message(
+                "❌ 권한이 없어요 (서버 관리자 전용).", ephemeral=True
+            )
+            return
+        raw = str(self.color.value).strip()
+        if raw in ("기본", "없음", "초기화", "default", "none", "reset"):
+            value = None
+        else:
+            value = parse_color(raw)
+            if value is None:
+                await interaction.response.send_message(
+                    f"❌ 색상을 못 읽어요. {HEX_HINT}로 적어주세요.",
+                    ephemeral=True,
+                )
+                return
+        set_color(guild.id, value)
+        await interaction.response.edit_message(
+            embed=admin_embed(guild.id), view=TicketAdminView()
+        )
+        await announce_panel_refresh(interaction, guild)
 
 
 def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
@@ -391,16 +623,12 @@ def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
     if status == "open":
         title = f"🎫 티켓 {number_label(n)}"
         color = discord.Color.blurple()
-        footer = "대화가 끝나면 [닫기] 를 눌러주세요"
         desc = "이 채널은 **문의자와 스태프**만 볼 수 있습니다.\n아래에서 편하게 이야기해주세요."
     else:
         title = f"🔒 티켓 {number_label(n)} · 닫힘"
         color = discord.Color.dark_grey()
-        footer = "다시 열거나 삭제하려면 아래 버튼을 눌러주세요"
         desc = "문의가 종료됐습니다.\n필요하면 **재오픈**하거나 채널을 삭제할 수 있어요."
-    embed = discord.Embed(
-        title=title, description=desc, color=color, timestamp=datetime.now(timezone.utc)
-    )
+    embed = discord.Embed(title=title, description=desc, color=color)
     embed.add_field(name="문의자", value=f"<@{rec.get('owner')}> (`{rec.get('owner')}`)", inline=False)
     embed.add_field(name="사유", value=(rec.get("reason") or "미입력")[:1000], inline=False)
     if rec.get("kind"):
@@ -410,7 +638,6 @@ def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
         embed.add_field(name="닫은 사람", value=f"<@{closed_by}>" if closed_by else "-", inline=True)
         if note:
             embed.add_field(name="닫은 사유", value=note[:1000], inline=False)
-    embed.set_footer(text=footer)
     return embed
 
 
@@ -451,8 +678,24 @@ async def _owner_member(guild, rec: dict) -> discord.Member | None:
 
 # ---------- 뷰 (재시작 후에도 유지되려면 custom_id 고정 + bot.add_view 필수) ----------
 class PanelView(discord.ui.View):
-    def __init__(self):
+    """유저용 티켓 패널 버튼.
+
+    mode: "both" = 둘 다 / "purchase" = 결제·주문 문의만 /
+          "general" = 일반·파트너 문의만
+    → 버튼을 골라 담은 뒤 게시하면 그 구조 그대로 패널에 붙는다.
+    """
+
+    def __init__(self, mode: str = "both"):
         super().__init__(timeout=None)
+        if mode == "purchase":
+            hide = {OPEN_GENERAL_BTN}
+        elif mode == "general":
+            hide = {OPEN_PURCHASE_BTN}
+        else:
+            hide = set()
+        for item in list(self.children):
+            if getattr(item, "custom_id", None) in hide:
+                self.remove_item(item)
 
     @discord.ui.button(
         custom_id=OPEN_PURCHASE_BTN, label="💳 결제 · 주문 문의",

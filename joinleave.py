@@ -353,8 +353,7 @@ async def send(member: discord.Member, kind: str, note: str | None = None) -> bo
         title = "🔴 멤버 퇴장"
         desc = f"**{safe_name}** 님이 서버를 떠났습니다."
 
-    embed = discord.Embed(title=title, description=desc, color=color,
-                          timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=title, description=desc, color=color)
     embed.add_field(name="서버 가입일", value=_date(joined), inline=True)
     embed.add_field(name="디스코드 가입일", value=_date(member.created_at), inline=True)
     if kind == "join":
@@ -364,7 +363,6 @@ async def send(member: discord.Member, kind: str, note: str | None = None) -> bo
         embed.add_field(name="서버 체류 시간", value=stayed, inline=True)
     if note:
         embed.add_field(name="⚠️ 확인", value=note[:300], inline=False)
-    embed.set_footer(text=f"{guild.name} · 멤버 {guild.member_count}명")
     if member.display_name:
         embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
 
@@ -415,14 +413,12 @@ def panel_embed(guild: discord.Guild, kind: str) -> discord.Embed:
         title=f"{'📥' if kind == 'join' else '📤'} {label} 로그 패널",
         description=f"{label} 로그 설정을 한곳에서 관리해요.",
         color=EYE[kind][3],
-        timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="로그 채널", value=ch, inline=True)
     embed.add_field(name="상태", value=on, inline=True)
     embed.add_field(name="안내 이미지", value=img, inline=True)
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.set_footer(text=f"{guild.name} · 입장/퇴장 로그는 각각 독립")
     return embed
 
 
