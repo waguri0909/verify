@@ -92,6 +92,11 @@ async def queue_put(item: dict) -> None:
     await _req("POST", "/api/queue", json=item)
 
 
+async def queue_clear() -> int:
+    """대기열을 비우고 지운 개수를 돌려준다."""
+    return int((await _req("POST", "/api/queue-clear")).get("cleared", 0))
+
+
 async def backup_count(guild_id: int) -> int:
     d = await _req("GET", "/api/backup-count", params={"guild": guild_id})
     return int(d.get("count", 0))

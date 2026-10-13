@@ -183,6 +183,20 @@ def set_panel_color(guild_id: int, value: int | None) -> None:
     )
 
 
+def get_verify_log_channel(guild_id: int) -> int | None:
+    """인증 로그를 받을 채널. 봇이 이 채널로 **일반 메시지**를 보내므로
+    디스코드 웹훅 429(IP 제한)와 무관하게 바로 도착한다."""
+    raw = get_guild_roles(guild_id).get("log_channel")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_verify_log_channel(guild_id: int, channel_id: int | None) -> None:
+    _put_guild_setting(guild_id, "log_channel", channel_id)
+
+
 def _role_from(guild: discord.Guild, role_id) -> discord.Role | None:
     """ID 가 깨졌거나 삭제된 역할이면 None — 뒤 후보를 계속 살펴보게 한다."""
     try:
@@ -352,59 +366,129 @@ async def refresh_verify_panels(
 # 웹에서 직접 못 보낸 인증 로그는 대기열에 남고, 봇은 여기서 꺼내 직접 보낸다.
 def _queue_interval() -> float:
     try:
-        v = float(os.getenv("LOG_QUEUE_INTERVAL", "10") or 10)
+        v = float(os.getenv("LOG_QUEUE_INTERVAL", "5") or 5)
     except ValueError:
-        v = 10.0
-    return min(300.0, max(5.0, v))
+        v = 5.0
+    return min(300.0, max(1.0, v))
 
 
 _LOG_QUEUE_INTERVAL = _queue_interval()
 _LOG_PUMP_TASK: asyncio.Task | None = None
-# 마지막 대기열 처리 결과 (/인증관리 → 🔍 로그 상태 에서 보여줌)
+# 마지막 대기열 처리 결과 (/인증로그 → 🔍 로그 상태 에서 보여줌)
 _LOG_PUMP_LAST: dict = {"ts": 0, "taken": 0, "sent": 0, "failed": 0, "detail": ""}
 
 
+async def _send_to_log_channel(guild_id: int, embed_dict: dict) -> str:
+    """로그 채널로 **일반 메시지**를 보낸다. 'sent' / 'skip' / 'fail' 반환.
+
+    웹훅이 아니라 평문 메시지라 디스코드 웹훅 429(IP 제한)와 상관없이 바로 간다.
+    """
+    ch_id = get_verify_log_channel(guild_id)
+    if not ch_id:
+        return "skip"  # 채널 미지정 → 실패 아님 (웹훅만 쓰거나 둘 다 없음)
+    ch = bot.get_channel(ch_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(ch_id)
+        except (discord.NotFound, discord.Forbidden):
+            log.warning("인증 로그 채널 접근 불가 guild=%s ch=%s", guild_id, ch_id)
+            set_verify_log_channel(guild_id, None)  # 사라진 채널 설정은 자동 정리
+            return "skip"
+        except discord.HTTPException as e:
+            log.warning("인증 로그 채널 조회 실패: HTTP %s", e.status)
+            return "fail"
+    if not isinstance(ch, discord.abc.Messageable):
+        return "skip"
+    try:
+        await ch.send(embed=discord.Embed.from_dict(embed_dict))
+        return "sent"
+    except discord.HTTPException as e:
+        log.warning("인증 로그 채널 전송 실패: HTTP %s", e.status)
+        return "fail"
+
+
+# 마지막 전송 실패 상세 (상태 화면용)
+_LAST_SEND_DETAIL = ""
+
+
+async def _process_queue_item(item: dict) -> tuple[int, int]:
+    """대기열 항목 하나를 전송한다. (성공 수, 실패 수) 반환. 실패분은 다시 투입."""
+    global _LAST_SEND_DETAIL
+    embed = item.get("embed")
+    if not isinstance(embed, dict):
+        return 0, 0
+    tries = int(item.get("tries", 0)) + 1
+    sent = failed = 0
+    pending: list[str] = []
+    needs_retry = False
+
+    # 1) 로그 채널 — 봇이 **일반 메시지**로 직접 (웹훅 429 와 무관)
+    try:
+        gid = int(str(item.get("guild") or "").strip() or 0)
+    except ValueError:
+        gid = 0
+    if gid:
+        res = await _send_to_log_channel(gid, embed)
+        if res == "sent":
+            sent += 1
+        elif res == "fail":
+            failed += 1
+            needs_retry = True
+            _LAST_SEND_DETAIL = "로그 채널 전송 실패"
+
+    # 2) 웹훅 — 봇 IP 로 POST
+    for url in item.get("urls") or []:
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        ok, detail = await webverify.post_webhook(url, {"embeds": [embed]})
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+            needs_retry = True
+            _LAST_SEND_DETAIL = detail
+            log.warning("로그 웹훅 전송 실패(시도 %s): %s", tries, detail)
+            pending.append(url)
+
+    if needs_retry:
+        try:
+            await webapi.queue_put({
+                "embed": embed,
+                "guild": item.get("guild", ""),
+                "urls": pending,
+                "tries": tries,
+            })
+        except Exception as e:
+            log.warning("로그 대기열 재투입 실패: %s", e)
+    return sent, failed
+
+
 async def _pump_log_queue() -> None:
-    """대기열 로그를 봇 IP 로 전송한다. 절대 죽지 않게 예외는 모두 삼킨다."""
+    """대기열 로그를 봇이 단독 전송한다. 절대 죽지 않게 예외는 모두 삼킨다.
+
+    로그 채널은 일반 메시지로, 웹훅은 봇 IP 로 POST 한다.
+    항목이 있었으면 1초 뒤에 또 받아오고(연속 인증 대응), 없으면 주기만큼 쉰다.
+    """
     global _LOG_PUMP_LAST
-    await asyncio.sleep(15)
+    await asyncio.sleep(5)
     while True:
+        delay = _LOG_QUEUE_INTERVAL
         try:
             items = await webapi.queue_take()
+            if items:
+                delay = 1.0  # 뭔가 들어왔으면 바로 또 확인 (연속 인증 로그 지연 없앰)
             sent = failed = 0
-            last_detail = ""
             for item in items:
-                embed = item.get("embed")
-                if not isinstance(embed, dict):
-                    continue
-                tries = int(item.get("tries", 0)) + 1
-                pending = []
-                for url in item.get("urls") or []:
-                    if not isinstance(url, str) or not url.startswith("http"):
-                        continue
-                    ok, detail = await webverify.post_webhook(
-                        url, {"embeds": [embed]}
-                    )
-                    if ok:
-                        sent += 1
-                    else:
-                        failed += 1
-                        last_detail = detail
-                        log.warning(
-                            "로그 대기열 전송 실패(시도 %s): %s", tries, detail
-                        )
-                        pending.append(url)
-                if pending:
-                    await webapi.queue_put(
-                        {"embed": embed, "urls": pending, "tries": tries}
-                    )
+                s, f = await _process_queue_item(item)
+                sent += s
+                failed += f
             _LOG_PUMP_LAST = {
                 "ts": int(time.time()), "taken": len(items),
-                "sent": sent, "failed": failed, "detail": last_detail,
+                "sent": sent, "failed": failed, "detail": _LAST_SEND_DETAIL,
             }
         except Exception:
             log.exception("로그 대기열 전송 중 오류")
-        await asyncio.sleep(_LOG_QUEUE_INTERVAL)
+        await asyncio.sleep(delay)
 
 
 def _start_log_pump() -> None:
@@ -791,6 +875,267 @@ class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
         )
 
 
+# ---------- 인증 로그 (/인증로그 → ephemeral 조작판) ----------
+# 로그 설정을 /인증관리 에서 빼서 전용 명령으로 분리했다.
+#   - 로그 채널: 봇이 **일반 메시지**로 직접 전송 → 디스코드 웹훅 429(IP 제한)와
+#     상관없이 바로 도착한다. 로그가 늦거나 안 올 때는 이쪽을 쓰면 된다.
+#   - 웹훅: 다른 서버까지 보내고 싶을 때만. 봇 IP 로 POST 한다.
+# custom_id 고정 → bot.add_view 로 영구 유지. 채널 메시지에는 절대 붙지 않는다.
+
+
+def verifylog_embed(guild: discord.Guild) -> discord.Embed:
+    ch_id = get_verify_log_channel(guild.id)
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch_id and ch is None:
+        ch_text = f"<#{ch_id}> (찾을 수 없음 — 다시 지정해주세요)"
+    elif isinstance(ch, discord.TextChannel):
+        ch_text = ch.mention
+    else:
+        ch_text = "❌ 미지정"
+    embed = discord.Embed(
+        title="📋 인증 로그 설정",
+        description=(
+            "로그채널이면 **봇이 직접 메시지**로 보내서 바로 도착해요.\n"
+            "웹훅은 다른 서버까지 보내고 싶을 때만 등록하면 돼요."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="로그채널", value=ch_text, inline=True)
+    embed.add_field(
+        name="지금 상태",
+        value="**[🔍 로그 상태]** 를 눌러 대기열/전송 결과를 확인하세요",
+        inline=False,
+    )
+    return embed
+
+
+class VerifyLogView(discord.ui.View):
+    """인증 로그 관리 — /인증로그 로만 열리는 ephemeral 뷰.
+
+    0행: 로그 채널 드롭다운 / 1행: 웹훅·상태·전송 버튼
+    custom_id 고정 → bot.add_view 로 영구 유지.
+    """
+
+    def __init__(self, guild_id: int | None = None):
+        super().__init__(timeout=None)
+        sel = discord.ui.ChannelSelect(
+            custom_id="verifylog:channel",
+            channel_types=[discord.ChannelType.text],
+            placeholder="인증 로그를 받을 채널 (봇이 직접 메시지로 보냄)",
+            min_values=1, max_values=1, row=0,
+        )
+        sel.callback = self._on_channel
+        self.add_item(sel)
+
+        specs = [
+            ("verifylog:webhook:set", "📜 웹훅 등록",
+             discord.ButtonStyle.secondary, self._webhook_set, 1),
+            ("verifylog:webhook:clear", "🗑 웹훅 해제",
+             discord.ButtonStyle.red, self._webhook_clear, 1),
+            ("verifylog:status", "🔍 로그 상태",
+             discord.ButtonStyle.secondary, self._log_status, 1),
+            ("verifylog:flush", "📤 지금 전송",
+             discord.ButtonStyle.green, self._flush, 1),
+            ("verifylog:queue:clear", "🗑 대기열 비우기",
+             discord.ButtonStyle.red, self._clear_queue, 1),
+        ]
+        for cid, label, style, cb, row in specs:
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=row)
+            b.callback = cb
+            self.add_item(b)
+
+    # --- 공통 ---
+    # discord.py 는 item.callback(interaction) 만 넘긴다 → 값은 interaction.data 에서.
+    @staticmethod
+    def _picked(interaction: discord.Interaction) -> int | None:
+        values = (interaction.data or {}).get("values") or []
+        return int(values[0]) if values else None
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        await interaction.response.edit_message(
+            embed=verifylog_embed(guild), view=VerifyLogView(guild.id)
+        )
+
+    # --- 로그 채널 ---
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        rid = self._picked(interaction)
+        if guild is None or rid is None:
+            return
+        ch = guild.get_channel(rid)
+        if not isinstance(ch, discord.TextChannel):
+            await _deny(interaction)
+            return
+        set_verify_log_channel(guild.id, ch.id)
+        await self._refresh(interaction)
+        await interaction.followup.send(
+            f"✅ 인증 로그를 {ch.mention} 으로 보낼게요.\n"
+            "봇이 직접 메시지를 보내므로 바로 도착해요.",
+            ephemeral=True,
+        )
+
+    # --- 지금 전송 / 대기열 비우기 ---
+    async def _flush(self, interaction: discord.Interaction) -> None:
+        """쌓인 로그를 지금 바로 꺼내 전송한다 (테스트 겸용)."""
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            items = await webapi.queue_take()
+        except webapi.ApiError as e:
+            await interaction.followup.send(
+                "❌ 웹(Render) 서버에 연결 못했어요: "
+                f"`{' '.join(str(e).split())[:200]}`",
+                ephemeral=True,
+            )
+            return
+        sent = failed = 0
+        for item in items:
+            s, f = await _process_queue_item(item)
+            sent += s
+            failed += f
+        if not items:
+            await interaction.followup.send(
+                "📭 대기열이 비어 있어요. 로그가 쌓이면 여기서 바로 보낼 수 있어요.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"📤 대기열 {len(items)}건 처리 → 전송 {sent} / 재시도 {failed}",
+            ephemeral=True,
+        )
+
+    async def _clear_queue(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            n = await webapi.queue_clear()
+        except webapi.ApiError as e:
+            await interaction.followup.send(
+                "❌ 웹(Render) 서버에 연결 못했어요: "
+                f"`{' '.join(str(e).split())[:200]}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(f"🗑 대기열 {n}건을 비웠어요.", ephemeral=True)
+
+    # --- 웹훅 ---
+    async def _webhook_set(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.send_modal(WebhookModal())
+
+    async def _webhook_clear(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            removed = await webapi.webhook_remove(guild.id)
+        except webapi.ApiError as e:
+            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "✅ 인증 로그 웹훅을 해제했어요." if removed else "설정된 웹훅이 없어요.",
+            ephemeral=True,
+        )
+
+    async def _log_status(self, interaction: discord.Interaction) -> None:
+        """웹훅 등록 여부 / 대기열 적체 / 마지막 전송 결과를 한 번에 보여준다.
+
+        로그가 안 올 때 "웹이 못 보냈나", "봇이 안 받아갔나", "웹훅이 아예 없나"
+        를 한 번에 가를 수 있게 하는 진단 버튼.
+        """
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            d = await webapi.web_status()
+        except webapi.ApiError as e:
+            await interaction.followup.send(
+                "❌ 웹(Render) 서버에 연결 못했어요.\n"
+                f"`{' '.join(str(e).split())[:200]}`\n"
+                "→ Render 가 꺼져 있거나, 봇 환경변수 `WEB_PUBLIC_URL` / `WEB_SECRET` "
+                "이 Render 쪽 값과 다르면 이럽니다.",
+                ephemeral=True,
+            )
+            return
+        hooks = int(d.get("webhooks", 0) or 0)
+        queued = int(d.get("queued", 0) or 0)
+        last = d.get("last") or {}
+        lines = ["📋 **인증 로그 상태**", ""]
+        lines.append(
+            f"· 웹훅 등록: {'✅ ' + str(hooks) + '개' if hooks else '❌ 없음'}"
+        )
+        if not hooks:
+            lines.append("  → **[📜 웹훅 등록]** 으로 URL 을 등록해주세요.")
+        lines.append(f"· 대기열 적체: **{queued}개**")
+        if queued:
+            lines.append(
+                "  → **봇 호스팅을 최신 코드로 올리고 재시작**해야 해요.\n"
+                "  (봇이 대기열을 안 받아가면 로그가 계속 여기 쌓입니다)"
+            )
+        lines.append("")
+        if last.get("ts"):
+            when = datetime.fromtimestamp(int(last["ts"])).strftime("%H:%M:%S")
+            ok = bool(last.get("ok"))
+            lines.append(
+                f"· 웹(Render) 마지막 전송: "
+                f"{'✅ 성공' if ok else '❌ 실패'} (`{when}`)"
+            )
+            if last.get("detail"):
+                lines.append(f"  - `{str(last['detail'])[:120]}`")
+            if last.get("queued"):
+                lines.append("  → 봇 대기열로 넘겼습니다.")
+        else:
+            lines.append(
+                "· 웹(Render) 마지막 전송: 기록 없음 (웹 인증이 아직 한 번도 안 일어났음)"
+            )
+        if _LOG_PUMP_LAST.get("ts"):
+            when = datetime.fromtimestamp(int(_LOG_PUMP_LAST["ts"])).strftime("%H:%M:%S")
+            lines.append(
+                f"· 봇 마지막 대기열 처리: 대상 {_LOG_PUMP_LAST.get('taken', 0)}개 → "
+                f"성공 {_LOG_PUMP_LAST.get('sent', 0)} / "
+                f"실패 {_LOG_PUMP_LAST.get('failed', 0)} (`{when}`)"
+            )
+        else:
+            lines.append("· 봇 마지막 대기열 처리: 아직 안 돌았어요 (재시작 후 5초~)")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+    # (웹훅 버튼들은 /인증관리 에서 옮겨옴)
+
+
+@tree.command(name="인증로그", description="인증 로그 설정 (로그채널 / 웹훅 / 전송 상태)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(채널="로그를 받을 채널. 비워두면 지금 설정 유지")
+async def verify_log_panel(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel | None = None,
+):
+    guild = interaction.guild
+    assert guild is not None
+    if 채널 is not None:
+        set_verify_log_channel(guild.id, 채널.id)
+    await interaction.response.send_message(
+        embed=verifylog_embed(guild), view=VerifyLogView(guild.id), ephemeral=True
+    )
+
+
 class RecoverModal(discord.ui.Modal, title="복구"):
     key = discord.ui.TextInput(
         label="복구키", placeholder="XXXX-XXXX-XXXX", required=True, max_length=64,
@@ -1138,12 +1483,6 @@ class VerifyAdminView(discord.ui.View):
         specs = [
             ("verify:admin:reset", "🔄 인증 초기화",
              discord.ButtonStyle.secondary, self._reset, 2),
-            ("verify:webhook:set", "📜 웹훅 등록",
-             discord.ButtonStyle.secondary, self._webhook_set, 2),
-            ("verify:webhook:clear", "🗑 웹훅 해제",
-             discord.ButtonStyle.red, self._webhook_clear, 2),
-            ("verify:log:status", "🔍 로그 상태",
-             discord.ButtonStyle.secondary, self._log_status, 2),
             ("verify:recover:key", "🔑 복구키 확인",
              discord.ButtonStyle.secondary, self._recover_key, 3),
             ("verify:recover:set", "✏️ 키 설정",
@@ -1247,93 +1586,6 @@ class VerifyAdminView(discord.ui.View):
             return
         await interaction.response.send_modal(UnverifyModal())
 
-    async def _webhook_set(self, interaction: discord.Interaction) -> None:
-        if not _verify_admin_ok(interaction):
-            await _deny(interaction)
-            return
-        await interaction.response.send_modal(WebhookModal())
-
-    async def _webhook_clear(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
-        if guild is None:
-            return
-        if not _verify_admin_ok(interaction):
-            await _deny(interaction)
-            return
-        await interaction.response.defer(ephemeral=True)
-        try:
-            removed = await webapi.webhook_remove(guild.id)
-        except webapi.ApiError as e:
-            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
-            return
-        await interaction.followup.send(
-            "✅ 인증 로그 웹훅을 해제했어요." if removed else "설정된 웹훅이 없어요.",
-            ephemeral=True,
-        )
-
-    async def _log_status(self, interaction: discord.Interaction) -> None:
-        """웹훅 등록 여부 / 대기열 적체 / 마지막 전송 결과를 한 번에 보여준다.
-
-        로그가 안 올 때 "웹이 못 보냈나", "봇이 안 받아갔나", "웹훅이 아예 없나"
-        를 한 번에 가를 수 있게 하는 진단 버튼.
-        """
-        if not _verify_admin_ok(interaction):
-            await _deny(interaction)
-            return
-        await interaction.response.defer(ephemeral=True)
-        try:
-            d = await webapi.web_status()
-        except webapi.ApiError as e:
-            await interaction.followup.send(
-                "❌ 웹(Render) 서버에 연결 못했어요.\n"
-                f"`{' '.join(str(e).split())[:200]}`\n"
-                "→ Render 가 꺼져 있거나, 봇 환경변수 `WEB_PUBLIC_URL` / `WEB_SECRET` "
-                "이 Render 쪽 값과 다르면 이럽니다.",
-                ephemeral=True,
-            )
-            return
-        hooks = int(d.get("webhooks", 0) or 0)
-        queued = int(d.get("queued", 0) or 0)
-        last = d.get("last") or {}
-        lines = ["📋 **인증 로그 상태**", ""]
-        lines.append(
-            f"· 웹훅 등록: {'✅ ' + str(hooks) + '개' if hooks else '❌ 없음'}"
-        )
-        if not hooks:
-            lines.append("  → 위 **[📜 웹훅 등록]** 으로 URL 을 등록해주세요.")
-        lines.append(f"· 대기열 적체: **{queued}개**")
-        if queued:
-            lines.append(
-                "  → **봇 호스팅을 최신 코드로 올리고 재시작**해야 해요.\n"
-                "  (봇이 대기열을 안 받아가면 로그가 계속 여기 쌓입니다)"
-            )
-        lines.append("")
-        if last.get("ts"):
-            when = datetime.fromtimestamp(int(last["ts"])).strftime("%H:%M:%S")
-            ok = bool(last.get("ok"))
-            lines.append(
-                f"· 웹(Render) 마지막 전송: "
-                f"{'✅ 성공' if ok else '❌ 실패'} (`{when}`)"
-            )
-            if last.get("detail"):
-                lines.append(f"  - `{str(last['detail'])[:120]}`")
-            if last.get("queued"):
-                lines.append("  → 봇 대기열로 넘겼습니다.")
-        else:
-            lines.append(
-                "· 웹(Render) 마지막 전송: 기록 없음 (웹 인증이 아직 한 번도 안 일어났음)"
-            )
-        if _LOG_PUMP_LAST.get("ts"):
-            when = datetime.fromtimestamp(int(_LOG_PUMP_LAST["ts"])).strftime("%H:%M:%S")
-            lines.append(
-                f"· 봇 마지막 대기열 처리: 대상 {_LOG_PUMP_LAST.get('taken', 0)}개 → "
-                f"성공 {_LOG_PUMP_LAST.get('sent', 0)} / "
-                f"실패 {_LOG_PUMP_LAST.get('failed', 0)} (`{when}`)"
-            )
-        else:
-            lines.append("· 봇 마지막 대기열 처리: 아직 안 돌았어요 (재시작 후 15초~)")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
-
     async def _recover_key(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None:
@@ -1397,6 +1649,7 @@ class VerifyAdminView(discord.ui.View):
 
 # 뷰 클래스가 아래에 정의돼서 위쪽 add_view 블록에 못 넣는다 → 여기서 등록
 bot.add_view(VerifyAdminView())
+bot.add_view(VerifyLogView())
 bot.add_view(RecoverConfirmView())
 bot.add_view(RecoverKeyDeleteView())
 

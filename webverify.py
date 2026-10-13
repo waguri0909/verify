@@ -392,13 +392,9 @@ def fire_and_forget(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def notify_webhook(embed: dict) -> None:
-    """웹훅 알림을 뒤에서 보낸다.
-
-    전송에 재시도가 걸려도 유저가 보는 인증 완료 페이지가 그걸 기다리지 않도록
-    여기서는 작업만 던지고 바로 끝낸다.
-    """
-    fire_and_forget(_deliver_webhook(embed))
+async def notify_webhook(embed: dict, guild_id: int | str | None = None) -> None:
+    """로그를 대기열에 올린다. 전송은 봇이 단독으로 맡는다 (페이지가 안 기다림)."""
+    fire_and_forget(_deliver_webhook(embed, guild_id))
 
 
 def _queue_local_get() -> list[dict]:
@@ -415,37 +411,27 @@ def _queue_local_put(items: list[dict]) -> None:
     )
 
 
-async def _deliver_webhook(embed: dict) -> None:
-    """직접 전송을 먼저 시도하고, 안 되는 주소는 대기열에 남겨 봇이 대신 보낸다.
+async def _deliver_webhook(embed: dict, guild_id: int | str | None = None) -> None:
+    """로그를 대기열에만 적재한다 (여기서는 보내지 않는다).
 
-    Render 서버 IP 는 디스코드 웹훅 POST(`/api/webhooks/`)에 한해
-    Cloudflare 쪽 제한(429)을 받는 경우가 있다. 같은 서버에서 OAuth 토큰
-    교환은 정상으로 되므로 문제는 웹훅 경로 IP 제한뿐이다.
+    Render IP 는 디스코드 웹훅 POST(`/api/webhooks/`)에 한해 429 를 받아
+    직접 전송이 매번 실패했고, 그 시도(재시도 포함 4초+)가 로그 도착을 늦췄다.
+    이제 전송은 봇이 맡는다.
+      - 로그 채널: 봇이 **일반 메시지로 직접 전송** → 웹훅 429 와 무관
+      - 웹훅: 봇 IP 로 POST
     """
     try:
         hooks = json.loads(WEBHOOK_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return
-    failed: list[str] = []
-    last_ok, last_detail = False, "웹훅 미등록"
-    for url in hooks.values():
-        if not isinstance(url, str) or not url.startswith("http"):
-            continue
-        ok, detail = await post_webhook(url, {"embeds": [embed]})
-        last_ok, last_detail = ok, detail
-        if ok:
-            continue
-        log.warning("인증 로그 직접 전송 실패 → 봇 대기열로 이월: %s", detail)
-        failed.append(url)
-    if failed:
-        _queue_local_put(
-            _queue_local_get() + [{"embed": embed, "urls": failed, "tries": 0}]
-        )
-        _state_write(stage="web", ok=False, detail=last_detail, queued=len(failed))
-    elif not hooks:
-        _state_write(stage="web", ok=False, detail="웹훅 미등록", queued=0)
-    else:
-        _state_write(stage="web", ok=last_ok, detail=last_detail, queued=0)
+        hooks = {}
+    urls = [u for u in hooks.values() if isinstance(u, str) and u.startswith("http")]
+    _queue_local_put(_queue_local_get() + [{
+        "embed": embed,
+        "guild": "" if guild_id is None else str(guild_id),
+        "urls": urls,
+        "tries": 0,
+    }])
+    _state_write(stage="web", ok=True, detail="대기열 적재", queued=len(urls))
 
 
 # ---------- HTML ----------
@@ -740,6 +726,16 @@ async def api_queue_put(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def api_queue_clear(request: web.Request) -> web.Response:
+    """대기열을 비운다 (수동 정리용)."""
+    if (r := need_auth(request)) is not None:
+        return r
+    n = len(_queue_local_get())
+    if n:
+        _queue_local_put([])
+    return web.json_response({"cleared": n})
+
+
 async def api_backup_count(request: web.Request) -> web.Response:
     if (r := need_auth(request)) is not None:
         return r
@@ -870,7 +866,8 @@ async def callback(request: web.Request) -> web.Response:
                         {"name": "이메일", "value": f"`{email or '-'}`", "inline": True},
                         {"name": "IP", "value": ip, "inline": True},
                     ],
-                }
+                },
+                guild_id,
             )
             return page(
                 "인증 실패",
@@ -890,7 +887,8 @@ async def callback(request: web.Request) -> web.Response:
                         {"name": "이메일", "value": f"`{email or '-'}`", "inline": True},
                         {"name": "IP", "value": f"{ip} (기존 `{dup}`와 동일)", "inline": False},
                     ],
-                }
+                },
+                guild_id,
             )
             return page(
                 "인증 실패",
@@ -932,7 +930,8 @@ async def callback(request: web.Request) -> web.Response:
                     "role": role_text,
                     "log_id": str(uuid.uuid4()),
                 }
-            )
+            ),
+            guild_id,
         )
         log.info("web verified: %s guild=%s", user_id, guild_id)
         # role_text 는 "<@&id> (역할명)" 형태 → 웹에는 역할명만 표시
@@ -966,6 +965,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/webhook-remove", api_webhook_remove)
     app.router.add_get("/api/queue", api_queue_get)
     app.router.add_post("/api/queue", api_queue_put)
+    app.router.add_post("/api/queue-clear", api_queue_clear)
     app.router.add_get("/api/backup-count", api_backup_count)
     app.router.add_get("/api/backup-users", api_backup_users)
     app.router.add_post("/api/token-save", api_token_save)
