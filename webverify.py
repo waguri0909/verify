@@ -29,6 +29,8 @@ log = logging.getLogger("webverify")
 BASE_DIR = Path(__file__).parent
 DB_FILE = BASE_DIR / "verifications.db"
 WEBHOOK_FILE = BASE_DIR / "webhooks.json"
+# 직접 전송이 막힌 로그를 남겨두고 봇이 대신 보내도록 하는 대기열
+LOGQUEUE_FILE = BASE_DIR / "logqueue.json"
 
 API = "https://discord.com/api/v10"
 SCOPES = "identify email guilds.join"
@@ -378,17 +380,44 @@ async def notify_webhook(embed: dict) -> None:
     fire_and_forget(_deliver_webhook(embed))
 
 
+def _queue_local_get() -> list[dict]:
+    try:
+        data = json.loads(LOGQUEUE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _queue_local_put(items: list[dict]) -> None:
+    LOGQUEUE_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 async def _deliver_webhook(embed: dict) -> None:
+    """직접 전송을 먼저 시도하고, 안 되는 주소는 대기열에 남겨 봇이 대신 보낸다.
+
+    Render 서버 IP 는 디스코드 웹훅 POST(`/api/webhooks/`)에 한해
+    Cloudflare 쪽 제한(429)을 받는 경우가 있다. 같은 서버에서 OAuth 토큰
+    교환은 정상으로 되므로 문제는 웹훅 경로 IP 제한뿐이다.
+    """
     try:
         hooks = json.loads(WEBHOOK_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return
+    failed: list[str] = []
     for url in hooks.values():
         if not isinstance(url, str) or not url.startswith("http"):
             continue
         ok, detail = await post_webhook(url, {"embeds": [embed]})
-        if not ok:
-            log.warning("인증 웹훅 전송 실패: %s", detail)
+        if ok:
+            continue
+        log.warning("인증 로그 직접 전송 실패 → 봇 대기열로 이월: %s", detail)
+        failed.append(url)
+    if failed:
+        _queue_local_put(
+            _queue_local_get() + [{"embed": embed, "urls": failed, "tries": 0}]
+        )
 
 
 # ---------- HTML ----------
@@ -613,6 +642,12 @@ async def api_webhook_test(request: web.Request) -> web.Response:
         return web.json_response({"detail": "guild/url 필요"}, status=400)
     if not is_webhook_url(url):
         return web.json_response({"ok": False, "detail": "웹훅 URL 형식 아님"}, status=200)
+    if body.get("skip_test"):
+        # 테스트는 봇 프로세스에서 보냈다 → 웹은 URL만 저장한다.
+        hooks = _load_json(WEBHOOK_FILE)
+        hooks[str(guild_id)] = url
+        _save_json(WEBHOOK_FILE, hooks)
+        return web.json_response({"ok": True, "detail": "test-skip", "saved": True})
     ok, detail = await post_webhook(
         url,
         {"embeds": [{"title": "🔗 인증 로그 연결됨", "description": "앞으로 인증 성공 시 여기에 로그가 전송됩니다.", "color": 0x57F287}]},
@@ -639,6 +674,37 @@ async def api_webhook_remove(request: web.Request) -> web.Response:
         del hooks[str(guild_id)]
         _save_json(WEBHOOK_FILE, hooks)
     return web.json_response({"removed": removed})
+
+
+# ---------- 로그 대기열 (봇이 직접 전송 못한 로그를 대신 보내기 위함) ----------
+MAX_QUEUE_TRIES = 3
+
+
+async def api_queue_get(request: web.Request) -> web.Response:
+    """쌓인 로그를 모두 꺼내 간다. 봇이 받은 뒤 전송 성공 시 사라진다."""
+    if (r := need_auth(request)) is not None:
+        return r
+    items = _queue_local_get()
+    if items:
+        _queue_local_put([])
+    return web.json_response({"items": items})
+
+
+async def api_queue_put(request: web.Request) -> web.Response:
+    """봇이 전송에 다시 실패한 항목을 돌려놓는다. MAX_QUEUE_TRIES 이상은 버린다."""
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        item = await request.json()
+    except Exception:
+        return web.json_response({"detail": "item 필요"}, status=400)
+    if not isinstance(item, dict) or "embed" not in item:
+        return web.json_response({"detail": "embed 필요"}, status=400)
+    if int(item.get("tries", 0)) >= MAX_QUEUE_TRIES:
+        log.warning("로그 대기열 버림(시도 %s회 초과)", item.get("tries"))
+        return web.json_response({"ok": True, "dropped": True})
+    _queue_local_put(_queue_local_get() + [item])
+    return web.json_response({"ok": True})
 
 
 async def api_backup_count(request: web.Request) -> web.Response:
@@ -865,6 +931,8 @@ def create_app() -> web.Application:
     app.router.add_get("/api/ping", api_ping)
     app.router.add_post("/api/webhook-test", api_webhook_test)
     app.router.add_post("/api/webhook-remove", api_webhook_remove)
+    app.router.add_get("/api/queue", api_queue_get)
+    app.router.add_post("/api/queue", api_queue_put)
     app.router.add_get("/api/backup-count", api_backup_count)
     app.router.add_get("/api/backup-users", api_backup_users)
     app.router.add_post("/api/token-save", api_token_save)

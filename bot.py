@@ -347,6 +347,57 @@ async def refresh_verify_panels(
     return ok, fail, missing
 
 
+# ---------- 로그 대기열 봇이 대신 전송 ----------
+# Render IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
+# 웹에서 직접 못 보낸 인증 로그는 대기열에 남고, 봇은 여기서 꺼내 직접 보낸다.
+def _queue_interval() -> float:
+    try:
+        v = float(os.getenv("LOG_QUEUE_INTERVAL", "10") or 10)
+    except ValueError:
+        v = 10.0
+    return min(300.0, max(5.0, v))
+
+
+_LOG_QUEUE_INTERVAL = _queue_interval()
+_LOG_PUMP_TASK: asyncio.Task | None = None
+
+
+async def _pump_log_queue() -> None:
+    """대기열 로그를 봇 IP 로 전송한다. 절대 죽지 않게 예외는 모두 삼킨다."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            for item in await webapi.queue_take():
+                embed = item.get("embed")
+                if not isinstance(embed, dict):
+                    continue
+                tries = int(item.get("tries", 0)) + 1
+                pending = []
+                for url in item.get("urls") or []:
+                    if not isinstance(url, str) or not url.startswith("http"):
+                        continue
+                    ok, detail = await webverify.post_webhook(
+                        url, {"embeds": [embed]}
+                    )
+                    if not ok:
+                        log.warning("로그 대기열 전송 실패(시도 %s): %s", tries, detail)
+                        pending.append(url)
+                if pending:
+                    await webapi.queue_put(
+                        {"embed": embed, "urls": pending, "tries": tries}
+                    )
+        except Exception:
+            log.exception("로그 대기열 전송 중 오류")
+        await asyncio.sleep(_LOG_QUEUE_INTERVAL)
+
+
+def _start_log_pump() -> None:
+    global _LOG_PUMP_TASK
+    if _LOG_PUMP_TASK is not None and not _LOG_PUMP_TASK.done():
+        return
+    _LOG_PUMP_TASK = asyncio.create_task(_pump_log_queue())
+
+
 # ---------- 이벤트 ----------
 _PANEL_REFRESH_DONE = False
 
@@ -394,6 +445,8 @@ async def on_ready():
     if not _PANEL_REFRESH_DONE:
         _PANEL_REFRESH_DONE = True
         await _refresh_all_panels()
+    # 웹(Render)이 직접 못 보낸 인증 로그를 봇 IP 로 대신 전송하도록 띄운다.
+    _start_log_pump()
 
 
 @bot.event
@@ -649,6 +702,15 @@ class UnverifyModal(discord.ui.Modal, title="인증 초기화"):
         )
 
 
+_WEBHOOK_TEST_PAYLOAD = {
+    "embeds": [{
+        "title": "🔗 인증 로그 연결됨",
+        "description": "앞으로 인증 성공 시 여기에 로그가 전송됩니다.",
+        "color": 0x57F287,
+    }]
+}
+
+
 class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
     url = discord.ui.TextInput(
         label="웹훅 URL", placeholder="https://discord.com/api/webhooks/...",
@@ -663,29 +725,42 @@ class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
             await _deny(interaction)
             return
         await interaction.response.defer(ephemeral=True)
-        try:
-            ok, detail, saved = await webapi.webhook_test(
-                guild.id, str(self.url.value).strip()
+        url = str(self.url.value).strip()
+        if not webverify.is_webhook_url(url):
+            await interaction.followup.send(
+                "❌ `https://discord.com/api/webhooks/...` 형태여야 해요.",
+                ephemeral=True,
             )
-        except webapi.ApiError as e:
-            await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
             return
+        # 테스트는 봇 프로세스에서 직접 보낸다.
+        # Render IP 는 디스코드 웹훅 POST 제한(429)을 받아 웹쪽 검사는
+        # 정상 주소도 항상 실패로 보이기 때문.
+        ok, detail = await webverify.post_webhook(url, _WEBHOOK_TEST_PAYLOAD)
+        saved = False
+        if ok or webverify.is_transient_error(detail):
+            try:
+                saved = await webapi.webhook_save(guild.id, url)
+            except webapi.ApiError as e:
+                await interaction.followup.send(
+                    f"{'✅' if ok else '⚠️'} 테스트는 "
+                    f"{'성공했지만' if ok else '실패했지만'} 저장도 실패했어요: {e}",
+                    ephemeral=True,
+                )
+                return
         short = " ".join(detail.split())[:160]
         if not ok:
             hint = ""
             if "429" in detail:
-                hint = ("\n💡 429 = 디스코드가 요청을 잠깐 제한했어요"
-                        "(서버 IP 기준 제한이에요. URL 은 틀리지 않았음).\n"
-                        "잠시 후 다시 시도하면 보통 통과해요.")
+                hint = ("\n💡 429 = 디스코드가 웹훅 요청을 잠깐 제한한 거예요.\n"
+                        "이번에는 **봇 쪽에서 직접 보냈는데도** 막힌 상태라 "
+                        "수 분 뒤 다시 시도해보세요.")
             elif "404" in detail:
                 hint = ("\n💡 404 = 웹훅이 삭제됐거나 URL 오타. "
                         "채널 설정 → 연동 → 웹훅에서 URL을 다시 복사해주세요.")
             elif "401" in detail or "403" in detail:
                 hint = "\n💡 401/403 = 토큰이 유효하지 않음. 웹훅을 새로 만드세요."
-            elif "형식" in detail:
-                hint = "\n💡 `https://discord.com/api/webhooks/...` 형태여야 해요."
             saved_note = (
-                "\n💾 URL 은 저장해뒀어요. 실제 인증 때 다시 전송을 시도해요."
+                "\n💾 URL 은 저장해뒀어요. 실제 인증 때 봇이 대신 전송을 시도해요."
                 if saved else ""
             )
             await interaction.followup.send(
@@ -694,7 +769,8 @@ class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
             )
             return
         await interaction.followup.send(
-            "✅ 인증 로그 웹훅이 설정됐어요. 테스트 메시지를 보냈으니 확인해보세요.",
+            "✅ 인증 로그 웹훅이 설정됐어요. 테스트 메시지를 보냈으니 확인해보세요.\n"
+            "이제 로그는 **봇이 직접 전송**해요.",
             ephemeral=True,
         )
 

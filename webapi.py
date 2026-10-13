@@ -62,6 +62,31 @@ async def webhook_remove(guild_id: int) -> bool:
     return bool((await _req("POST", "/api/webhook-remove", json={"guild": guild_id})).get("removed"))
 
 
+async def webhook_save(guild_id: int, url: str) -> bool:
+    """URL만 저장한다. 전송 테스트는 봇 프로세스에서 이미 보냈으므로 웹은 스킵한다.
+
+    Render IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
+    웹쪽에서 테스트하면 항상 실패로 보인다.
+    """
+    d = await _req(
+        "POST", "/api/webhook-test",
+        json={"guild": guild_id, "url": url, "skip_test": True},
+    )
+    return bool(d.get("saved"))
+
+
+async def queue_take() -> list[dict]:
+    """봇이 대신 전송할 로그를 모두 가져온다."""
+    d = await _req("GET", "/api/queue")
+    items = d.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+async def queue_put(item: dict) -> None:
+    """전송에 다시 실패한 로그를 대기열로 돌려놓는다."""
+    await _req("POST", "/api/queue", json=item)
+
+
 async def backup_count(guild_id: int) -> int:
     d = await _req("GET", "/api/backup-count", params={"guild": guild_id})
     return int(d.get("count", 0))
