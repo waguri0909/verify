@@ -664,21 +664,33 @@ class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            ok, detail = await webapi.webhook_test(guild.id, str(self.url.value).strip())
+            ok, detail, saved = await webapi.webhook_test(
+                guild.id, str(self.url.value).strip()
+            )
         except webapi.ApiError as e:
             await interaction.followup.send(f"❌ 웹 서버 연결 실패: {e}", ephemeral=True)
             return
+        short = " ".join(detail.split())[:160]
         if not ok:
             hint = ""
-            if "404" in detail:
+            if "429" in detail:
+                hint = ("\n💡 429 = 디스코드가 요청을 잠깐 제한했어요"
+                        "(서버 IP 기준 제한이에요. URL 은 틀리지 않았음).\n"
+                        "잠시 후 다시 시도하면 보통 통과해요.")
+            elif "404" in detail:
                 hint = ("\n💡 404 = 웹훅이 삭제됐거나 URL 오타. "
                         "채널 설정 → 연동 → 웹훅에서 URL을 다시 복사해주세요.")
             elif "401" in detail or "403" in detail:
                 hint = "\n💡 401/403 = 토큰이 유효하지 않음. 웹훅을 새로 만드세요."
             elif "형식" in detail:
                 hint = "\n💡 `https://discord.com/api/webhooks/...` 형태여야 해요."
+            saved_note = (
+                "\n💾 URL 은 저장해뒀어요. 실제 인증 때 다시 전송을 시도해요."
+                if saved else ""
+            )
             await interaction.followup.send(
-                f"❌ 웹훅 전송 테스트 실패.\n상세: `{detail}`{hint}", ephemeral=True
+                f"❌ 웹훅 전송 테스트 실패.\n상세: `{short}`{hint}{saved_note}",
+                ephemeral=True,
             )
             return
         await interaction.followup.send(

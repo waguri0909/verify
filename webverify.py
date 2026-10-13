@@ -6,6 +6,7 @@
 인증 기록은 verifications.db(SQLite)에 저장.
 """
 
+import asyncio
 import hashlib
 import hmac
 import html
@@ -261,6 +262,7 @@ def build_success_embed(info: dict) -> dict:
     desc = (
         f"👤 사용자정보\n<@{info['user_id']}>\n"
         f"`{info['username']}`(Global name: `{info['global_name']}`, ID: `{info['user_id']}`)\n"
+        f"📧 이메일\n`{info.get('email') or '-'}`\n"
         f"🎂 계정 생성일\n`{info['created']}` (`{info['created_rel']}`)\n"
         f"🔑 2단계 인증\n`{info['mfa']}`\n"
         f"🕒 인증 시각\n`{info['now']}` (`{info['now_rel']}`)\n"
@@ -354,7 +356,29 @@ async def add_role(s: aiohttp.ClientSession, guild_id: int, user_id: str, role_i
         return False, reasons.get(code, f"역할 지급 실패 (code {code}). 관리자에게 문의하세요.")
 
 
-async def notify_webhook(embed: dict):
+_background_tasks: set[asyncio.Task] = set()
+
+
+def fire_and_forget(coro) -> None:
+    """웹훅 전송을 뒤에서 돌린다.
+
+    재시도(429/5xx)를 걸어도 유저가 보는 인증 완료 페이지가 그걸 기다리지 않는다.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def notify_webhook(embed: dict) -> None:
+    """웹훅 알림을 뒤에서 보낸다.
+
+    전송에 재시도가 걸려도 유저가 보는 인증 완료 페이지가 그걸 기다리지 않도록
+    여기서는 작업만 던지고 바로 끝낸다.
+    """
+    fire_and_forget(_deliver_webhook(embed))
+
+
+async def _deliver_webhook(embed: dict) -> None:
     try:
         hooks = json.loads(WEBHOOK_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -362,13 +386,9 @@ async def notify_webhook(embed: dict):
     for url in hooks.values():
         if not isinstance(url, str) or not url.startswith("http"):
             continue
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
-                async with s.post(url, json={"embeds": [embed]}):
-                    pass
-        except Exception as e:
-            log.warning("인증 웹훅 실패: %s", e)
+        ok, detail = await post_webhook(url, {"embeds": [embed]})
+        if not ok:
+            log.warning("인증 웹훅 전송 실패: %s", detail)
 
 
 # ---------- HTML ----------
@@ -526,23 +546,43 @@ def is_webhook_url(url: str) -> bool:
     return "/api/webhooks/" in p.path
 
 
+# 디스코드 앞단(Cloudflare)이 잠깐 429/5xx 를 물고 늘어질 때가 있다.
+# URL 형식 검사는 통과했으니 일시 오류로 보고 곧바로 포기하지 않는다.
+RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
 async def post_webhook(url: str, payload: dict) -> tuple[bool, str]:
-    """웹훅 POST. (성공여부, 상세) 반환."""
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        headers = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
-            async with s.post(url, json=payload) as r:
-                if r.status in (200, 204):
-                    return True, f"HTTP {r.status}"
-                body = (await r.text())[:200]
-                detail = f"HTTP {r.status} {body}"
-                log.warning("웹훅 전송 실패: %s", detail)
-                return False, detail
-    except Exception as e:
-        detail = str(e)[:200]
-        log.warning("웹훅 오류: %s", e)
-        return False, detail
+    """웹훅 POST. (성공여부, 상세) 반환. 429/5xx 는 1초 → 3초 간격으로 최대 3회 재시도."""
+    detail = ""
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(1.0 if attempt == 1 else 3.0)
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
+                async with s.post(url, json=payload) as r:
+                    if r.status in (200, 204):
+                        return True, f"HTTP {r.status}"
+                    detail = f"HTTP {r.status} {(await r.text())[:200]}"
+                    if r.status not in RETRY_STATUS:
+                        log.warning("웹훅 전송 실패: %s", detail)
+                        return False, detail
+                    log.warning("웹훅 재시도 %s/3: HTTP %s", attempt + 1, r.status)
+        except Exception as e:
+            detail = str(e)[:200]
+            log.warning("웹훅 오류(재시도 %s/3): %s", attempt + 1, e)
+    log.warning("웹훅 전송 실패: %s", detail)
+    return False, detail
+
+
+def is_transient_error(detail: str) -> bool:
+    """디스코드가 잠깐 막은 경우(429/5xx, 접속 오류) → URL 자체는 정상으로 본다."""
+    if detail.startswith("HTTP "):
+        return detail[5:].lstrip()[:3] in {"429", "500", "502", "503", "504"}
+    low = detail.lower()
+    if "invalid url" in low or "invalidurl" in low or "bad url" in low:
+        return False  # 주소 자체가 이상함 → 저장하지 않는다
+    return True  # HTTP 가 아닌 오류(연결 실패 등)도 URL 형식은 맞았음
 
 
 # ---------- 내부 API (봇 → 웹, X-Api-Key = WEB_SECRET) ----------
@@ -577,11 +617,13 @@ async def api_webhook_test(request: web.Request) -> web.Response:
         url,
         {"embeds": [{"title": "🔗 인증 로그 연결됨", "description": "앞으로 인증 성공 시 여기에 로그가 전송됩니다.", "color": 0x57F287}]},
     )
-    if ok:
+    # 테스트가 막혀도 URL 형식은 맞았다면(429/5xx 같은 일시 오류) 저장해 둔다.
+    saved = bool(ok or is_transient_error(detail))
+    if saved:
         hooks = _load_json(WEBHOOK_FILE)
         hooks[str(guild_id)] = url
         _save_json(WEBHOOK_FILE, hooks)
-    return web.json_response({"ok": ok, "detail": detail})
+    return web.json_response({"ok": ok, "detail": detail, "saved": saved})
 
 
 async def api_webhook_remove(request: web.Request) -> web.Response:
@@ -726,6 +768,7 @@ async def callback(request: web.Request) -> web.Response:
                     "color": 0xED4245,
                     "fields": [
                         {"name": "유저", "value": f"{username} (`{user_id}`)", "inline": False},
+                        {"name": "이메일", "value": f"`{email or '-'}`", "inline": True},
                         {"name": "IP", "value": ip, "inline": True},
                     ],
                 }
@@ -745,6 +788,7 @@ async def callback(request: web.Request) -> web.Response:
                     "color": 0xED4245,
                     "fields": [
                         {"name": "유저", "value": f"{username} (`{user_id}`)", "inline": False},
+                        {"name": "이메일", "value": f"`{email or '-'}`", "inline": True},
                         {"name": "IP", "value": f"{ip} (기존 `{dup}`와 동일)", "inline": False},
                     ],
                 }
@@ -773,6 +817,7 @@ async def callback(request: web.Request) -> web.Response:
                     "user_id": user_id,
                     "username": me.get("username") or "-",
                     "global_name": me.get("global_name") or me.get("username") or "-",
+                    "email": email,
                     "created": ko_datetime(created),
                     "created_rel": ko_rel(created),
                     "mfa": "ON" if me.get("mfa_enabled") else "OFF",

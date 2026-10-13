@@ -48,9 +48,14 @@ async def api_ping() -> bool:
     return (await _req("GET", "/api/ping")).get("ok") is True
 
 
-async def webhook_test(guild_id: int, url: str) -> tuple[bool, str]:
+async def webhook_test(guild_id: int, url: str) -> tuple[bool, str, bool]:
+    """(성공여부, 상세, URL 저장됨 여부) 반환.
+
+    저장됨 여부는 테스트가 429/5xx 같은 일시 오류로 막혔을 때 True →
+    URL 형식은 맞으므로 등록해 두고 실제 인증 때 다시 시도한다.
+    """
     d = await _req("POST", "/api/webhook-test", json={"guild": guild_id, "url": url})
-    return bool(d.get("ok")), str(d.get("detail", ""))
+    return bool(d.get("ok")), str(d.get("detail", "")), bool(d.get("saved"))
 
 
 async def webhook_remove(guild_id: int) -> bool:
