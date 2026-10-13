@@ -8,4 +8,5 @@ roles.json
 tickets.json
 webhooks.json
 logqueue.json
+logstate.json
 logs.json

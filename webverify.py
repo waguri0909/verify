@@ -31,6 +31,27 @@ DB_FILE = BASE_DIR / "verifications.db"
 WEBHOOK_FILE = BASE_DIR / "webhooks.json"
 # 직접 전송이 막힌 로그를 남겨두고 봇이 대신 보내도록 하는 대기열
 LOGQUEUE_FILE = BASE_DIR / "logqueue.json"
+# 마지막 전송 결과 (/api/ping 에서 봇이 확인용으로 읽어감)
+LOGSTATE_FILE = BASE_DIR / "logstate.json"
+
+
+def _state_write(**kw) -> None:
+    try:
+        data = {"ts": int(time.time())}
+        data.update(kw)
+        LOGSTATE_FILE.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _state_read() -> dict:
+    try:
+        data = json.loads(LOGSTATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 API = "https://discord.com/api/v10"
 SCOPES = "identify email guilds.join"
@@ -406,10 +427,12 @@ async def _deliver_webhook(embed: dict) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         return
     failed: list[str] = []
+    last_ok, last_detail = False, "웹훅 미등록"
     for url in hooks.values():
         if not isinstance(url, str) or not url.startswith("http"):
             continue
         ok, detail = await post_webhook(url, {"embeds": [embed]})
+        last_ok, last_detail = ok, detail
         if ok:
             continue
         log.warning("인증 로그 직접 전송 실패 → 봇 대기열로 이월: %s", detail)
@@ -418,6 +441,11 @@ async def _deliver_webhook(embed: dict) -> None:
         _queue_local_put(
             _queue_local_get() + [{"embed": embed, "urls": failed, "tries": 0}]
         )
+        _state_write(stage="web", ok=False, detail=last_detail, queued=len(failed))
+    elif not hooks:
+        _state_write(stage="web", ok=False, detail="웹훅 미등록", queued=0)
+    else:
+        _state_write(stage="web", ok=last_ok, detail=last_detail, queued=0)
 
 
 # ---------- HTML ----------
@@ -629,7 +657,12 @@ def need_auth(request: web.Request) -> web.Response | None:
 async def api_ping(request: web.Request) -> web.Response:
     if (r := need_auth(request)) is not None:
         return r
-    return web.json_response({"ok": True})
+    return web.json_response({
+        "ok": True,
+        "webhooks": len(_load_json(WEBHOOK_FILE)),
+        "queued": len(_queue_local_get()),
+        "last": _state_read(),
+    })
 
 
 async def api_webhook_test(request: web.Request) -> web.Response:

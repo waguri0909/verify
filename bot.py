@@ -360,14 +360,20 @@ def _queue_interval() -> float:
 
 _LOG_QUEUE_INTERVAL = _queue_interval()
 _LOG_PUMP_TASK: asyncio.Task | None = None
+# 마지막 대기열 처리 결과 (/인증관리 → 🔍 로그 상태 에서 보여줌)
+_LOG_PUMP_LAST: dict = {"ts": 0, "taken": 0, "sent": 0, "failed": 0, "detail": ""}
 
 
 async def _pump_log_queue() -> None:
     """대기열 로그를 봇 IP 로 전송한다. 절대 죽지 않게 예외는 모두 삼킨다."""
+    global _LOG_PUMP_LAST
     await asyncio.sleep(15)
     while True:
         try:
-            for item in await webapi.queue_take():
+            items = await webapi.queue_take()
+            sent = failed = 0
+            last_detail = ""
+            for item in items:
                 embed = item.get("embed")
                 if not isinstance(embed, dict):
                     continue
@@ -379,13 +385,23 @@ async def _pump_log_queue() -> None:
                     ok, detail = await webverify.post_webhook(
                         url, {"embeds": [embed]}
                     )
-                    if not ok:
-                        log.warning("로그 대기열 전송 실패(시도 %s): %s", tries, detail)
+                    if ok:
+                        sent += 1
+                    else:
+                        failed += 1
+                        last_detail = detail
+                        log.warning(
+                            "로그 대기열 전송 실패(시도 %s): %s", tries, detail
+                        )
                         pending.append(url)
                 if pending:
                     await webapi.queue_put(
                         {"embed": embed, "urls": pending, "tries": tries}
                     )
+            _LOG_PUMP_LAST = {
+                "ts": int(time.time()), "taken": len(items),
+                "sent": sent, "failed": failed, "detail": last_detail,
+            }
         except Exception:
             log.exception("로그 대기열 전송 중 오류")
         await asyncio.sleep(_LOG_QUEUE_INTERVAL)
@@ -1126,6 +1142,8 @@ class VerifyAdminView(discord.ui.View):
              discord.ButtonStyle.secondary, self._webhook_set, 2),
             ("verify:webhook:clear", "🗑 웹훅 해제",
              discord.ButtonStyle.red, self._webhook_clear, 2),
+            ("verify:log:status", "🔍 로그 상태",
+             discord.ButtonStyle.secondary, self._log_status, 2),
             ("verify:recover:key", "🔑 복구키 확인",
              discord.ButtonStyle.secondary, self._recover_key, 3),
             ("verify:recover:set", "✏️ 키 설정",
@@ -1252,6 +1270,69 @@ class VerifyAdminView(discord.ui.View):
             "✅ 인증 로그 웹훅을 해제했어요." if removed else "설정된 웹훅이 없어요.",
             ephemeral=True,
         )
+
+    async def _log_status(self, interaction: discord.Interaction) -> None:
+        """웹훅 등록 여부 / 대기열 적체 / 마지막 전송 결과를 한 번에 보여준다.
+
+        로그가 안 올 때 "웹이 못 보냈나", "봇이 안 받아갔나", "웹훅이 아예 없나"
+        를 한 번에 가를 수 있게 하는 진단 버튼.
+        """
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            d = await webapi.web_status()
+        except webapi.ApiError as e:
+            await interaction.followup.send(
+                "❌ 웹(Render) 서버에 연결 못했어요.\n"
+                f"`{' '.join(str(e).split())[:200]}`\n"
+                "→ Render 가 꺼져 있거나, 봇 환경변수 `WEB_PUBLIC_URL` / `WEB_SECRET` "
+                "이 Render 쪽 값과 다르면 이럽니다.",
+                ephemeral=True,
+            )
+            return
+        hooks = int(d.get("webhooks", 0) or 0)
+        queued = int(d.get("queued", 0) or 0)
+        last = d.get("last") or {}
+        lines = ["📋 **인증 로그 상태**", ""]
+        lines.append(
+            f"· 웹훅 등록: {'✅ ' + str(hooks) + '개' if hooks else '❌ 없음'}"
+        )
+        if not hooks:
+            lines.append("  → 위 **[📜 웹훅 등록]** 으로 URL 을 등록해주세요.")
+        lines.append(f"· 대기열 적체: **{queued}개**")
+        if queued:
+            lines.append(
+                "  → **봇 호스팅을 최신 코드로 올리고 재시작**해야 해요.\n"
+                "  (봇이 대기열을 안 받아가면 로그가 계속 여기 쌓입니다)"
+            )
+        lines.append("")
+        if last.get("ts"):
+            when = datetime.fromtimestamp(int(last["ts"])).strftime("%H:%M:%S")
+            ok = bool(last.get("ok"))
+            lines.append(
+                f"· 웹(Render) 마지막 전송: "
+                f"{'✅ 성공' if ok else '❌ 실패'} (`{when}`)"
+            )
+            if last.get("detail"):
+                lines.append(f"  - `{str(last['detail'])[:120]}`")
+            if last.get("queued"):
+                lines.append("  → 봇 대기열로 넘겼습니다.")
+        else:
+            lines.append(
+                "· 웹(Render) 마지막 전송: 기록 없음 (웹 인증이 아직 한 번도 안 일어났음)"
+            )
+        if _LOG_PUMP_LAST.get("ts"):
+            when = datetime.fromtimestamp(int(_LOG_PUMP_LAST["ts"])).strftime("%H:%M:%S")
+            lines.append(
+                f"· 봇 마지막 대기열 처리: 대상 {_LOG_PUMP_LAST.get('taken', 0)}개 → "
+                f"성공 {_LOG_PUMP_LAST.get('sent', 0)} / "
+                f"실패 {_LOG_PUMP_LAST.get('failed', 0)} (`{when}`)"
+            )
+        else:
+            lines.append("· 봇 마지막 대기열 처리: 아직 안 돌았어요 (재시작 후 15초~)")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     async def _recover_key(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild

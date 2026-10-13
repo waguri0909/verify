@@ -48,6 +48,11 @@ async def api_ping() -> bool:
     return (await _req("GET", "/api/ping")).get("ok") is True
 
 
+async def web_status() -> dict:
+    """웹(Render) 쪽 로그 상태: 등록 웹훅 수 / 대기열 적체 / 마지막 전송 결과."""
+    return await _req("GET", "/api/ping")
+
+
 async def webhook_test(guild_id: int, url: str) -> tuple[bool, str, bool]:
     """(성공여부, 상세, URL 저장됨 여부) 반환.
 
