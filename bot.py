@@ -322,6 +322,103 @@ async def _locate_panel(
     return None
 
 
+# ---------- 패널 자동 발견 ----------
+# panels.json 은 Git 대상이 아니라 서버 로컬 파일이라 호스팅을 옮기거나
+# 컨테이너가 초기화되면 통째로 비어진다. 그럴 때마다 /인증패널 /티켓패널 을
+# 다시 치지 않도록, 채널에 살아있는 패널을 스스로 되찾는다.
+_OAUTH_ROLE_RE = re.compile(r"[?&]role=(\d{15,})")
+_SCAN_CHANNELS = 40
+_SCAN_HISTORY = 50
+
+
+def _panel_gone(guild: discord.Guild, hint_channel) -> bool:
+    """기록된 채널이 그대로 있고 봇도 읽을 수 있는데 메시지를 못 찾았으면 삭제된 것.
+
+    권한이 없어서 못 읽는 경우와 삭제된 경우를 가르기 위함 — 전자는 건드리지 않는다.
+    """
+    try:
+        ch = guild.get_channel(int(hint_channel)) if hint_channel else None
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return False
+    me = guild.me
+    if me is None:
+        return False
+    perms = ch.permissions_for(me)
+    return bool(perms.view_channel and perms.read_message_history)
+
+
+def _verify_panel_record(msg: discord.Message) -> dict | None:
+    """이 메시지가 인증 패널이면 기록용 dict, 아니면 None.
+
+    판정 근거: 임베드 1개 + 링크 버튼에 웹 인증 주소(guest=role 파라미터)가 붙은 것.
+    그 밖의 봇 메시지(환영/공지/로그)는 전부 걸러진다.
+    """
+    if len(msg.embeds) != 1 or msg.guild is None:
+        return None
+    url = None
+    for row in msg.components:
+        for item in getattr(row, "components", ()):
+            if getattr(item, "style", None) is not discord.ButtonStyle.link:
+                continue
+            u = getattr(item, "url", "") or ""
+            if "guild=" in u and "role=" in u:
+                url = u
+                break
+        if url:
+            break
+    if not url:
+        return None
+
+    m = _OAUTH_ROLE_RE.search(url)
+    role_id = int(m.group(1)) if m else None
+    if role_id is None:
+        role_id = get_guild_roles(msg.guild.id).get("verified")
+
+    e = msg.embeds[0]
+    desc = e.description or ""
+    line1, line2 = desc.split("\n\n", 1) if "\n\n" in desc else (desc, "")
+    # 기본값과 똑같은 줄은 굳이 적지 않는다 → 나중에 기본 문구를 고치면 패널도 따라간다.
+    return {
+        "guild": msg.guild.id,
+        "channel": msg.channel.id,
+        "verified": role_id,
+        "title": None if (e.title or "") == DEFAULT_TITLE else e.title,
+        "line1": None if not line1 or line1 == DEFAULT_LINE1 else line1,
+        "line2": None if not line2 or line2 == DEFAULT_LINE2 else line2,
+    }
+
+
+async def discover_verify_panels(guild: discord.Guild) -> int:
+    """채널에 살아있는 인증 패널을 찾아 panels.json 에 되찾는다. 새로 등록된 개수."""
+    me = guild.me
+    author_id = me.id if me else (bot.user.id if bot.user else 0)
+    if not author_id:
+        return 0
+    panels = _load_json(PANEL_FILE)
+    added = 0
+    for ch in guild.text_channels[:_SCAN_CHANNELS]:
+        if me is not None and not ch.permissions_for(me).read_message_history:
+            continue
+        try:
+            messages = [m async for m in ch.history(limit=_SCAN_HISTORY)]
+        except discord.HTTPException:
+            continue
+        for msg in messages:
+            if msg.author.id != author_id or str(msg.id) in panels:
+                continue
+            rec = _verify_panel_record(msg)
+            if rec is None:
+                continue
+            panels[str(msg.id)] = rec
+            added += 1
+    if added:
+        _save_json(PANEL_FILE, panels)
+        log.info("인증 패널 자동 발견 %s개 guild=%s", added, guild.id)
+    return added
+
+
 async def refresh_verify_panels(
     guild: discord.Guild, role: discord.Role | None = None
 ) -> tuple[int, int, int]:
@@ -346,6 +443,11 @@ async def refresh_verify_panels(
         msg = await _locate_panel(guild, mid, e.get("channel"))
         if msg is None:
             missing += 1
+            # 읽기 권한이 있는데도 못 찾았으면 메시지가 지워진 것 → 목록에서 정리.
+            # (권한 문제로 못 읽는 경우는 남겨둬야 다음에 또 찾을 수 있다)
+            if _panel_gone(guild, e.get("channel")):
+                panels.pop(mid_s, None)
+                changed = True
             continue
         embed = build_panel(e.get("title"), e.get("line1"), e.get("line2"), color)
         try:
@@ -534,8 +636,19 @@ _PANEL_REFRESH_DONE = False
 
 
 async def _refresh_all_panels() -> None:
-    """서버에 게시된 인증/티켓 패널을 지금 규칙(footer·시각 제거, 색상, 버튼)으로 다시 그린다."""
+    """서버에 게시된 인증/티켓 패널을 지금 규칙(footer·시각 제거, 색상, 버튼)으로 다시 그린다.
+
+    레지스트리가 비어있어도 채널에서 스스로 되찾은 뒤 다시 그리기 때문에
+    파일이 초기화돼도 /인증패널 /티켓패널 을 다시 칠 필요가 없다.
+    """
     for g in list(bot.guilds):
+        # 1) 목록 복구 — 빈 파일·누락된 항목을 채널에서 되찾는다
+        for name, finder in (("인증", discover_verify_panels), ("티켓", ticket.discover_panels)):
+            try:
+                await finder(g)
+            except Exception:
+                log.exception("%s 패널 자동 발견 실패 guild=%s", name, getattr(g, "id", "?"))
+        # 2) 지금 규칙으로 다시 그리기
         jobs = (
             ("인증", lambda gg=g: refresh_verify_panels(gg, resolve_verified_role(gg))),
             ("티켓", lambda gg=g: ticket.refresh_panels(gg)),

@@ -284,13 +284,76 @@ def _restyle(msg: discord.Message, color: int) -> discord.Embed:
     return embed
 
 
+# ---------- 패널 자동 발견 (파일 초기화·호스팅 이관에도 목록을 되찾는다) ----------
+def _open_panel_button(msg: discord.Message) -> bool:
+    """현행 티켓 패널(열기 버튼 1~2개)이면 True.
+
+    구(舊) 1버튼 패널(OPEN_BTN)은 일부러 제외한다 — 등록되면 갱신 때 현행
+    2버튼 뷰로 덮어써져 버튼 구성이 바뀌기 때문이다.
+    """
+    if not msg.embeds:
+        return False
+    wanted = (OPEN_PURCHASE_BTN, OPEN_GENERAL_BTN)
+    for row in msg.components:
+        for item in getattr(row, "components", ()):
+            if getattr(item, "custom_id", None) in wanted:
+                return True
+    return False
+
+
+def _panel_gone(guild: discord.Guild, hint_channel) -> bool:
+    """기록된 채널이 그대로 있고 봇도 읽을 수 있는데 메시지를 못 찾았으면 삭제된 것."""
+    try:
+        ch = guild.get_channel(_as_int(hint_channel)) if hint_channel else None
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(ch, discord.TextChannel):
+        return False
+    me = guild.me
+    if me is None:
+        return False
+    perms = ch.permissions_for(me)
+    return bool(perms.view_channel and perms.read_message_history)
+
+
+async def discover_panels(guild: discord.Guild) -> int:
+    """채널에 살아있는 현행 티켓 패널을 찾아 tickets.json 에 되찾는다. 새로 등록된 개수."""
+    me = guild.me
+    author_id = me.id if me else 0
+    if not author_id:
+        return 0
+    data = _load()
+    known = data["panels"]
+    added = 0
+    for ch in guild.text_channels[:40]:
+        if me is not None and not ch.permissions_for(me).read_message_history:
+            continue
+        try:
+            messages = [m async for m in ch.history(limit=50)]
+        except discord.HTTPException:
+            continue
+        for msg in messages:
+            if msg.author.id != author_id or str(msg.id) in known:
+                continue
+            if not _open_panel_button(msg):
+                continue
+            known[str(msg.id)] = {"guild": guild.id, "channel": msg.channel.id}
+            added += 1
+    if added:
+        _save(data)
+        log.info("티켓 패널 자동 발견 %s개 guild=%s", added, guild.id)
+    return added
+
+
 async def refresh_panels(guild: discord.Guild) -> tuple[int, int, int]:
     """이 서버에 게시된 티켓 패널 전부를 지금 설정(색상·노출 버튼)으로 다시 쓴다."""
     mode = button_mode(guild.id)
     color = get_color(guild.id)
     view = PanelView(mode)
+    data = _load()
     ok = fail = missing = 0
-    for mid_s, rec in list(_load()["panels"].items()):
+    changed = False
+    for mid_s, rec in list(data["panels"].items()):
         if not isinstance(rec, dict) or rec.get("guild") != guild.id:
             continue
         mid = _as_int(mid_s)
@@ -299,16 +362,23 @@ async def refresh_panels(guild: discord.Guild) -> tuple[int, int, int]:
         msg = await _locate_panel(guild, mid, rec.get("channel"))
         if msg is None:
             missing += 1
+            # 읽기 권한이 있는데도 못 찾았으면 메시지가 지워진 것 → 목록에서 정리
+            if _panel_gone(guild, rec.get("channel")):
+                data["panels"].pop(mid_s, None)
+                changed = True
             continue
         cid = getattr(getattr(msg, "channel", None), "id", None)
         if rec.get("channel") != cid:
-            save_panel(mid, guild.id, cid)  # 채널 위치 백필 → 다음엔 바로 찾는다
+            rec["channel"] = cid  # 채널 위치 백필 → 다음엔 바로 찾는다
+            changed = True
         try:
             await msg.edit(embed=_restyle(msg, color), view=view)
         except discord.HTTPException:
             fail += 1
             continue
         ok += 1
+    if changed:
+        _save(data)
     return ok, fail, missing
 
 
