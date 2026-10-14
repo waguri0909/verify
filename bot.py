@@ -463,13 +463,17 @@ async def _process_queue_item(item: dict) -> tuple[int, int]:
     return sent, failed
 
 
+# 웹 API 거부(401 등) 경고 마지막 시각 — 같은 이유로 5초마다 도배하지 않기 위함
+_API_FAIL_LOG_AT = 0.0
+
+
 async def _pump_log_queue() -> None:
     """대기열 로그를 봇이 단독 전송한다. 절대 죽지 않게 예외는 모두 삼킨다.
 
     로그 채널은 일반 메시지로, 웹훅은 봇 IP 로 POST 한다.
     항목이 있었으면 1초 뒤에 또 받아오고(연속 인증 대응), 없으면 주기만큼 쉰다.
     """
-    global _LOG_PUMP_LAST
+    global _LOG_PUMP_LAST, _API_FAIL_LOG_AT
     await asyncio.sleep(5)
     while True:
         delay = _LOG_QUEUE_INTERVAL
@@ -486,6 +490,27 @@ async def _pump_log_queue() -> None:
                 "ts": int(time.time()), "taken": len(items),
                 "sent": sent, "failed": failed, "detail": _LAST_SEND_DETAIL,
             }
+        except webapi.ApiError as e:
+            # 서버가 응답을 했는데 거부한 경우(401 등)다.
+            # 스택트레이스를 5초마다 찍지 않도록 한 줄 경고로 바꾸고
+            # 같은 이유는 재시도 주기도 60초로 벌려준다.
+            detail = " ".join(str(e).split())
+            delay = 60.0
+            _LOG_PUMP_LAST = {
+                "ts": int(time.time()), "taken": 0, "sent": 0, "failed": 0,
+                "detail": detail,
+            }
+            now = time.time()
+            if now - _API_FAIL_LOG_AT >= 60:
+                _API_FAIL_LOG_AT = now
+                if "unauthorized" in detail.lower():
+                    log.warning(
+                        "웹(Render) API 인증 거부(401) — 봇 WEB_SECRET 과 "
+                        "Render Env WEB_SECRET 이 다릅니다. "
+                        "/인증로그 → [🔍 로그 상태] 에서 확인하세요 (1분에 1회만 표시)"
+                    )
+                else:
+                    log.warning("웹(Render) API 오류 (1분에 1회만 표시): %s", detail)
         except Exception:
             log.exception("로그 대기열 전송 중 오류")
         await asyncio.sleep(delay)
@@ -1112,6 +1137,15 @@ class VerifyLogView(discord.ui.View):
                 f"성공 {_LOG_PUMP_LAST.get('sent', 0)} / "
                 f"실패 {_LOG_PUMP_LAST.get('failed', 0)} (`{when}`)"
             )
+            _detail = str(_LOG_PUMP_LAST.get("detail") or "")
+            if _detail:
+                lines.append(f"  - `{_detail[:120]}`")
+            if "unauthorized" in _detail.lower():
+                lines.append(
+                    "  ⚠️ **401 거부** → 봇 Env 와 **Render Env 의 `WEB_SECRET` 이 다릅니다.**\n"
+                    "     Render(웹) → Env 탭에서 `WEB_SECRET` 값 확인해서\n"
+                    "     **Bot-Hosting Env의 `WEB_SECRET` 을 그 값으로 바꿔 저장**하면 끝나요."
+                )
         else:
             lines.append("· 봇 마지막 대기열 처리: 아직 안 돌았어요 (재시작 후 5초~)")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
