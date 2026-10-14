@@ -2,7 +2,7 @@
 
 봇(디스호스트)과 웹(Render)이 파일을 공유할 수 없어서
 토큰·웹훅 같은 공유 데이터는 이 API로 주고받음.
-인증: X-Api-Key 헤더 = WEB_SECRET. 베이스 = WEB_PUBLIC_URL.
+인증: X-Api-Key 헤더 = WEB_SECRET. 베이스 = WEB_API_URL (없으면 WEB_PUBLIC_URL).
 """
 
 import aiohttp
@@ -17,7 +17,9 @@ class ApiError(Exception):
 
 
 def _base() -> str:
-    return env("WEB_PUBLIC_URL").rstrip("/")
+    # 봇과 웹이 같은 서버에 있으면 WEB_API_URL 로 로컬 주소를 쓴다.
+    # WEB_PUBLIC_URL 은 디스코드 리다이렉트 주소용이라 그대로 둔다(둘 다 있을 때).
+    return (env("WEB_API_URL") or env("WEB_PUBLIC_URL")).rstrip("/")
 
 
 async def _req(method: str, path: str, **kw) -> dict:

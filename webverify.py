@@ -871,6 +871,12 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def callback(request: web.Request) -> web.Response:
+    # OAUTH_FORWARD 가 있으면(Render) 토큰 교환이 막히는 그 서버에서 처리하지 않고
+    # 옮겨놓은 서버로 그대로 넘긴다. 디스코드 리다이렉트 주소는 그대로 써도 된다.
+    fwd = env("OAUTH_FORWARD")
+    if fwd:
+        qs = request.query_string
+        raise web.HTTPFound(fwd.rstrip("/") + "/callback" + ("?" + qs if qs else ""))
     code = request.query.get("code", "")
     parsed = parse_state(request.query.get("state", ""))
     if not code or not parsed:

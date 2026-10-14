@@ -15,8 +15,8 @@ services:
         sync: false
       - key: WEB_PUBLIC_URL
         sync: false
-      - key: WEB_PUBLIC_URL
-        sync: false
+      - key: OAUTH_FORWARD
+        value: https://0uqekbvcof.apps.bot-hosting.cloud
       - key: WEB_SECRET
         generateValue: true
       - key: VERIFIED_ROLE_NAME

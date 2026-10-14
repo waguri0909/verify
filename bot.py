@@ -60,7 +60,13 @@ class Config:
     auth_channel_id: int | None = _get_int("AUTH_CHANNEL_ID")
     log_channel_id: int | None = _get_int("LOG_CHANNEL_ID")
     min_account_age_days: int = int(os.getenv("MIN_ACCOUNT_AGE_DAYS", "7") or 7)
-    web_port: int = int(os.getenv("PORT", "") or os.getenv("WEB_PORT", "8000") or 8000)
+    # 디스호스트는 SERVER_PORT 를 준다. 로컬/Render 는 PORT, 그 외 WEB_PORT.
+    web_port: int = int(
+        os.getenv("PORT", "")
+        or os.getenv("WEB_PORT", "")
+        or os.getenv("SERVER_PORT", "")
+        or "8000"
+    )
 
     def validate(self) -> list[str]:
         errors = []
