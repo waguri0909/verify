@@ -685,6 +685,9 @@ async def api_ping(request: web.Request) -> web.Response:
         "webhooks": len(_load_json(WEBHOOK_FILE)),
         "queued": len(_queue_local_get()),
         "last": _state_read(),
+        # 진단용: 이 프로세스가 실제로 읽고 있는 설정 (비밀값 아님)
+        "public_url": env("WEB_PUBLIC_URL"),
+        "oauth_forward": env("OAUTH_FORWARD"),
     })
 
 
