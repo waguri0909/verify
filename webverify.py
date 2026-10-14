@@ -306,7 +306,7 @@ def build_success_embed(info: dict) -> dict:
 HEADERS = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
 
 
-async def exchange_code(s: aiohttp.ClientSession, code: str) -> dict | None:
+async def exchange_code(s: aiohttp.ClientSession, code: str) -> tuple[dict | None, str]:
     data = {
         "client_id": env("DISCORD_CLIENT_ID"),
         "client_secret": env("DISCORD_CLIENT_SECRET"),
@@ -316,9 +316,10 @@ async def exchange_code(s: aiohttp.ClientSession, code: str) -> dict | None:
     }
     async with s.post(f"{API}/oauth2/token", data=data) as r:
         if r.status != 200:
-            log.warning("토큰 교환 실패: HTTP %s %s", r.status, (await r.text())[:200])
-            return None
-        return await r.json()
+            detail = (await r.text())[:200]
+            log.warning("토큰 교환 실패: HTTP %s %s", r.status, detail)
+            return None, f"HTTP {r.status} {detail}"
+        return await r.json(), ""
 
 
 def save_tokens(user_id: str, guild_id: int, access: str, refresh: str, expires_in: int):
@@ -349,12 +350,13 @@ def get_backed_users(guild_id: int) -> list[tuple]:
         con.close()
 
 
-async def fetch_user(s: aiohttp.ClientSession, access_token: str) -> dict | None:
+async def fetch_user(s: aiohttp.ClientSession, access_token: str) -> tuple[dict | None, str]:
     async with s.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as r:
         if r.status != 200:
-            log.warning("유저 조회 실패: HTTP %s", r.status)
-            return None
-        return await r.json()
+            detail = (await r.text())[:200]
+            log.warning("유저 조회 실패: HTTP %s %s", r.status, detail)
+            return None, f"HTTP {r.status} {detail}"
+        return await r.json(), ""
 
 
 async def add_role(s: aiohttp.ClientSession, guild_id: int, user_id: str, role_id: int) -> tuple[bool, str]:
@@ -843,12 +845,34 @@ async def callback(request: web.Request) -> web.Response:
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
-        tok = await exchange_code(s, code)
+        tok, tok_err = await exchange_code(s, code)
         token = (tok or {}).get("access_token")
         if not token:
+            await notify_webhook(
+                {
+                    "title": "❌ 인증 실패 (토큰 교환)",
+                    "color": 0xED4245,
+                    "fields": [
+                        {"name": "사유", "value": f"```{tok_err or '알 수 없음'}```", "inline": False},
+                        {"name": "IP", "value": f"`{ip}`", "inline": True},
+                    ],
+                },
+                guild_id,
+            )
             return page("인증 실패", "Discord 승인에 실패했습니다. 다시 시도해주세요.", False)
-        me = await fetch_user(s, token)
+        me, me_err = await fetch_user(s, token)
         if not me:
+            await notify_webhook(
+                {
+                    "title": "❌ 인증 실패 (유저 조회)",
+                    "color": 0xED4245,
+                    "fields": [
+                        {"name": "사유", "value": f"```{me_err or '알 수 없음'}```", "inline": False},
+                        {"name": "IP", "value": f"`{ip}`", "inline": True},
+                    ],
+                },
+                guild_id,
+            )
             return page("인증 실패", "계정 정보를 가져오지 못했습니다. 다시 시도해주세요.", False)
 
         user_id = str(me["id"])
@@ -899,6 +923,19 @@ async def callback(request: web.Request) -> web.Response:
 
         ok, reason = await add_role(s, guild_id, user_id, role_id)
         if not ok:
+            await notify_webhook(
+                {
+                    "title": "❌ 인증 실패 (역할 지급)",
+                    "color": 0xED4245,
+                    "fields": [
+                        {"name": "유저", "value": f"{username} (`{user_id}`)", "inline": False},
+                        {"name": "역할", "value": f"<@&{role_id}> (`{role_id}`)", "inline": False},
+                        {"name": "사유", "value": f"```{reason}```", "inline": False},
+                        {"name": "IP", "value": f"`{ip}`", "inline": True},
+                    ],
+                },
+                guild_id,
+            )
             return page("인증 실패", reason, False)
 
         save_record(guild_id, user_id, email, ip)
