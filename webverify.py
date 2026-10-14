@@ -305,6 +305,18 @@ def build_success_embed(info: dict) -> dict:
 # ---------- Discord API ----------
 HEADERS = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
 
+# Render 같은 클라우드 IP는 Discord Cloudflare 에서 가끔 429(HTML 챌린지)를 먹인다.
+# 한 번에 포기하지 않도록 잠깐 쉬었다가 다시 시도한다. 4xx(429 제외)는 재시도하지 않는다.
+DISCORD_TRY = 3
+
+
+def _retryable(status: int) -> bool:
+    return status == 429 or status >= 500
+
+
+async def _backoff(attempt: int) -> None:
+    await asyncio.sleep(1.5 * attempt)
+
 
 async def exchange_code(s: aiohttp.ClientSession, code: str) -> tuple[dict | None, str]:
     data = {
@@ -314,12 +326,18 @@ async def exchange_code(s: aiohttp.ClientSession, code: str) -> tuple[dict | Non
         "code": code,
         "redirect_uri": redirect_uri(),
     }
-    async with s.post(f"{API}/oauth2/token", data=data) as r:
-        if r.status != 200:
+    last = ""
+    for attempt in range(1, DISCORD_TRY + 1):
+        async with s.post(f"{API}/oauth2/token", data=data) as r:
+            if r.status == 200:
+                return await r.json(), ""
             detail = (await r.text())[:200]
-            log.warning("토큰 교환 실패: HTTP %s %s", r.status, detail)
-            return None, f"HTTP {r.status} {detail}"
-        return await r.json(), ""
+            last = f"HTTP {r.status} {detail}"
+            log.warning("토큰 교환 실패(%s/%s): HTTP %s %s", attempt, DISCORD_TRY, r.status, detail)
+            if not _retryable(r.status) or attempt >= DISCORD_TRY:
+                break
+            await _backoff(attempt)
+    return None, last
 
 
 def save_tokens(user_id: str, guild_id: int, access: str, refresh: str, expires_in: int):
@@ -351,34 +369,51 @@ def get_backed_users(guild_id: int) -> list[tuple]:
 
 
 async def fetch_user(s: aiohttp.ClientSession, access_token: str) -> tuple[dict | None, str]:
-    async with s.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as r:
-        if r.status != 200:
+    last = ""
+    for attempt in range(1, DISCORD_TRY + 1):
+        async with s.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as r:
+            if r.status == 200:
+                return await r.json(), ""
             detail = (await r.text())[:200]
-            log.warning("유저 조회 실패: HTTP %s %s", r.status, detail)
-            return None, f"HTTP {r.status} {detail}"
-        return await r.json(), ""
+            last = f"HTTP {r.status} {detail}"
+            log.warning("유저 조회 실패(%s/%s): HTTP %s %s", attempt, DISCORD_TRY, r.status, detail)
+            if not _retryable(r.status) or attempt >= DISCORD_TRY:
+                break
+            await _backoff(attempt)
+    return None, last
 
 
 async def add_role(s: aiohttp.ClientSession, guild_id: int, user_id: str, role_id: int) -> tuple[bool, str]:
     """REST로 역할 지급. (성공여부, 사유) 반환."""
     url = f"{API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}"
     headers = {**HEADERS, "Authorization": f"Bot {env('DISCORD_TOKEN')}"}
-    async with s.put(url, headers=headers) as r:
-        if r.status == 204:
-            return True, "ok"
-        try:
-            code = (await r.json()).get("code", r.status)
-        except Exception:
-            code = r.status
-        # 10007=서버에 없음, 10011=롤 없음, 10004=서버 없음, 50013=권한부족
-        reasons = {
-            0: "봇 토큰이 유효하지 않습니다. 관리자가 토큰을 교체해야 합니다.",
-            10007: "서버에 입장하지 않았습니다. 먼저 서버에 들어와주세요.",
-            10011: "역할이 삭제됐습니다. 관리자에게 문의하세요.",
-            10004: "서버 설정을 확인해주세요. (관리자 문의)",
-            50013: "봇 권한이 부족합니다. (관리자 문의)",
-        }
-        return False, reasons.get(code, f"역할 지급 실패 (code {code}). 관리자에게 문의하세요.")
+    # 10007=서버에 없음, 10011=롤 없음, 10004=서버 없음, 50013=권한부족
+    reasons = {
+        0: "봇 토큰이 유효하지 않습니다. 관리자가 토큰을 교체해야 합니다.",
+        10007: "서버에 입장하지 않았습니다. 먼저 서버에 들어와주세요.",
+        10011: "역할이 삭제됐습니다. 관리자에게 문의하세요.",
+        10004: "서버 설정을 확인해주세요. (관리자 문의)",
+        50013: "봇 권한이 부족합니다. (관리자 문의)",
+    }
+    last = ""
+    for attempt in range(1, DISCORD_TRY + 1):
+        async with s.put(url, headers=headers) as r:
+            if r.status == 204:
+                return True, "ok"
+            try:
+                code = (await r.json()).get("code", r.status)
+            except Exception:
+                code = r.status
+            try:
+                code_i = int(code)
+            except (TypeError, ValueError):
+                code_i = 400
+            last = reasons.get(code_i, f"역할 지급 실패 (code {code_i}). 관리자에게 문의하세요.")
+            log.warning("역할 지급 실패(%s/%s): HTTP %s %s", attempt, DISCORD_TRY, r.status, last)
+            if not _retryable(code_i) or attempt >= DISCORD_TRY:
+                break
+            await _backoff(attempt)
+    return False, last
 
 
 _background_tasks: set[asyncio.Task] = set()
