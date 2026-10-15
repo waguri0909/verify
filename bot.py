@@ -349,6 +349,22 @@ def _panel_gone(guild: discord.Guild, hint_channel) -> bool:
     return bool(perms.view_channel and perms.read_message_history)
 
 
+def _iter_buttons(components):
+    """메시지 컴포넌트 트리를 재귀로 훑어 버튼만 거둔다.
+
+    버튼은 ActionRow(·Container) 안에 들어 있고, discord.py 에서 안쪽 목록의
+    속성 이름은 `.children` 이다. `.components` 로 읽으면 속성이 없어 항상
+    빈 목록이 나오고 → 버튼을 한 개도 못 본다. 이 자리가 틀리면 자동 발견이
+    조용히 0건으로 끝난다.
+    """
+    for comp in components or ():
+        kids = getattr(comp, "children", None)
+        if kids:
+            yield from _iter_buttons(kids)
+        elif hasattr(comp, "url") and hasattr(comp, "custom_id"):
+            yield comp  # 버튼에만 url/custom_id 가 둘 다 있다
+
+
 def _verify_panel_record(msg: discord.Message) -> dict | None:
     """이 메시지가 인증 패널이면 기록용 dict, 아니면 None.
 
@@ -358,15 +374,10 @@ def _verify_panel_record(msg: discord.Message) -> dict | None:
     if len(msg.embeds) != 1 or msg.guild is None:
         return None
     url = None
-    for row in msg.components:
-        for item in getattr(row, "components", ()):
-            if getattr(item, "style", None) is not discord.ButtonStyle.link:
-                continue
-            u = getattr(item, "url", "") or ""
-            if "guild=" in u and "role=" in u:
-                url = u
-                break
-        if url:
+    for item in _iter_buttons(msg.components):
+        u = getattr(item, "url", None)
+        if u and "guild=" in u and "role=" in u:
+            url = u
             break
     if not url:
         return None

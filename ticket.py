@@ -285,6 +285,21 @@ def _restyle(msg: discord.Message, color: int) -> discord.Embed:
 
 
 # ---------- 패널 자동 발견 (파일 초기화·호스팅 이관에도 목록을 되찾는다) ----------
+def _iter_buttons(components):
+    """메시지 컴포넌트 트리를 재귀로 훑어 버튼만 거둔다.
+
+    버튼은 ActionRow(·Container) 안에 있고 discord.py 에서 안쪽 목록 이름은
+    `.children` 이다. `.components` 로 읽으면 속성이 없어 항상 빈 목록이 나온다.
+    (bot._iter_buttons 와 같은 로직 — 순환 import 를 피하려고 각자 둔다)
+    """
+    for comp in components or ():
+        kids = getattr(comp, "children", None)
+        if kids:
+            yield from _iter_buttons(kids)
+        elif hasattr(comp, "custom_id"):
+            yield comp
+
+
 def _open_panel_button(msg: discord.Message) -> bool:
     """현행 티켓 패널(열기 버튼 1~2개)이면 True.
 
@@ -294,10 +309,9 @@ def _open_panel_button(msg: discord.Message) -> bool:
     if not msg.embeds:
         return False
     wanted = (OPEN_PURCHASE_BTN, OPEN_GENERAL_BTN)
-    for row in msg.components:
-        for item in getattr(row, "components", ()):
-            if getattr(item, "custom_id", None) in wanted:
-                return True
+    for item in _iter_buttons(msg.components):
+        if getattr(item, "custom_id", None) in wanted:
+            return True
     return False
 
 
