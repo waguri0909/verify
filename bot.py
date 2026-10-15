@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -201,6 +202,19 @@ def get_verify_log_channel(guild_id: int) -> int | None:
 
 def set_verify_log_channel(guild_id: int, channel_id: int | None) -> None:
     _put_guild_setting(guild_id, "log_channel", channel_id)
+
+
+def get_err_channel(guild_id: int) -> int | None:
+    """봇 오류 자동 보고를 받을 채널 (/오류보고)."""
+    raw = get_guild_roles(guild_id).get("err_channel")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_err_channel(guild_id: int, channel_id: int | None) -> None:
+    _put_guild_setting(guild_id, "err_channel", channel_id)
 
 
 def _role_from(guild: discord.Guild, role_id) -> discord.Role | None:
@@ -642,6 +656,191 @@ def _start_log_pump() -> None:
     _LOG_PUMP_TASK = asyncio.create_task(_pump_log_queue())
 
 
+# ---------- 오류 자동 보고 (/오류보고) ----------
+# 봇이 오류로 조용히 죽어도 운영자가 먼저 알 수 있도록 ERROR 이상 로그를 모아
+# /오류보고 로 지정한 채널로 보낸다. (호스팅 콘솔은 글자를 못 읽으니 여기가 유일한 창구)
+#
+# 설계 포인트
+#  · logging.Handler 는 await 를 못 한다 → 핸들러는 **큐에만** 넣는다.
+#    전송은 별도 태스크(_pump_err_reports) 가 주기적으로 비워한다.
+#  · 재접속 때마다 태스크가 새로 생기지 않게 플래그로 막는다.
+#  · 같은 오류 60초 중복 억제 + 최소 3초 전송 간격 (디스코드 rate limit 보호)
+#  · 이 태스크 자체가 죽으면 오류 보고가 영영 안 되므로 어떤 경우에도 종료하지 않는다.
+
+_ERR_QUEUE: list[dict] = []          # 대기 중인 오류
+_ERR_SEEN: dict[str, float] = {}     # 중복 억제용 key -> 시각
+_ERR_STATE = {"sent": 0, "suppressed": 0, "last_sent": 0.0, "last_error": ""}
+_ERR_TASK: asyncio.Task | None = None
+_ERR_DEDUP_WINDOW = 60.0
+_ERR_MIN_GAP = 3.0
+_ERR_QUEUE_MAX = 50
+_ERR_LOGGER_NAME = "bot.errreport"
+# 슬래시 오류는 서버 컨텍스트를 안다 → 그 서버 채널로만 보낸다(유저 정보 새는 것 방지).
+# 로깅 핸들러는 컨텍스트를 모른다 → on_app_error 가 이 값을 잠깐 넣어두고 핸들러가 가져간다.
+_ERR_CTX_GUILD: int | None = None
+
+
+def _err_targets() -> dict[int, int]:
+    """오류 보고 채널로 지정된 곳. {채널 ID: 서버 ID}."""
+    out: dict[int, int] = {}
+    try:
+        data = _load_json(ROLES_FILE)
+    except Exception:
+        return out
+    for gid, cfg in data.items():
+        if not isinstance(cfg, dict):
+            continue
+        try:
+            cid = int(cfg.get("err_channel"))
+            g = int(gid)
+        except (TypeError, ValueError):
+            continue
+        if cid and g:
+            out[cid] = g
+    return out
+
+
+class _ErrorReportHandler(logging.Handler):
+    """ERROR 이상 로그를 수집만 한다. 전송은 _pump_err_reports 가 한다."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _ERR_CTX_GUILD
+        # 로깅 핸들러는 절대 예외를 밖으로 던지면 안 된다 (봇 전체가 죽을 수 있음).
+        try:
+            if record.levelno < logging.ERROR:
+                return
+            if record.name == _ERR_LOGGER_NAME:
+                return  # 자기 자신이 만든 보고는 다시 보고하지 않는다
+            if not _err_targets():
+                return  # 아무도 안 받으면 애초에 모으지 않는다
+            msg = record.getMessage()
+            key = f"{record.name}|{record.levelname}|{msg[:200]}"
+            now = time.time()
+            for k in [k for k, ts in _ERR_SEEN.items() if now - ts > 300]:
+                _ERR_SEEN.pop(k, None)
+            if now - _ERR_SEEN.get(key, 0.0) < _ERR_DEDUP_WINDOW:
+                _ERR_STATE["suppressed"] += 1
+                return
+            _ERR_SEEN[key] = now
+            if record.exc_info:
+                tb = "".join(traceback.format_exception(*record.exc_info))
+            elif record.exc_text:
+                tb = str(record.exc_text)
+            else:
+                tb = str(record.stack_info or "")
+            _ERR_QUEUE.append(
+                {
+                    "name": record.name,
+                    "level": record.levelname,
+                    "msg": msg,
+                    "tb": tb,
+                    "file": record.pathname or "",
+                    "line": record.lineno or 0,
+                    "guild": _ERR_CTX_GUILD,
+                    "ts": now,
+                }
+            )
+            _ERR_CTX_GUILD = None  # 소비했다 → 다음 오류로 새는 것을 막는다
+            if len(_ERR_QUEUE) > _ERR_QUEUE_MAX:
+                del _ERR_QUEUE[:-_ERR_QUEUE_MAX]
+        except Exception:
+            pass
+
+
+def _err_embed(item: dict) -> discord.Embed:
+    lines = [ln for ln in (item.get("tb") or "").splitlines() if ln.strip()]
+    # 오류가 터진 줄: traceback 안의 마지막 File 프레임
+    where = ""
+    for ln in reversed(lines):
+        s = ln.strip()
+        if s.startswith('File "'):
+            where = s
+            break
+    if not where:
+        where = f"`{os.path.basename(item.get('file') or '?')}` {item.get('line') or ''}".strip()
+    tail = lines[-1].strip() if lines else str(item.get("msg", ""))[:200]
+    body = "\n".join(lines[-8:])
+    if len(body) > 900:
+        body = "…" + body[-900:]
+
+    # footer·우하단 시각 표시는 사용자 요구로 전면 금지 (테스트가 소스 스캔으로 검증)
+    e = discord.Embed(
+        title="🚨 봇 오류",
+        description=f"**{str(item.get('msg', ''))[:400]}**",
+        color=discord.Color.red(),
+    )
+    e.add_field(name="터진 위치", value=where[:300] or "-", inline=False)
+    e.add_field(name="마지막 줄", value=f"`{tail[:200]}`", inline=False)
+    if body:
+        e.add_field(name="스택", value=f"```py\n{body}\n```", inline=False)
+    e.add_field(name="소스", value=f"`{item.get('name', '?')}`", inline=True)
+    if item.get("guild"):
+        e.add_field(name="서버", value=f"`{item['guild']}`", inline=True)
+    return e
+
+
+async def _deliver_err(item: dict) -> None:
+    targets = _err_targets()
+    gid = item.get("guild")
+    if gid is not None:
+        # 서버를 아는 오류는 그 서버 채널로만 (다른 서버 관리자에게 유저 정보가 새는 것을 막는다)
+        ch_id = get_err_channel(int(gid))
+        targets = {ch_id: int(gid)} if ch_id else {}
+    if not targets:
+        return
+    embed = _err_embed(item)
+    for ch_id, guild_id in targets.items():
+        ch = bot.get_channel(ch_id)
+        if ch is None:
+            try:
+                ch = await bot.fetch_channel(ch_id)
+            except (discord.NotFound, discord.Forbidden):
+                log.info("오류 보고 채널 사라짐 → 설정 정리 ch=%s", ch_id)
+                set_err_channel(guild_id, None)  # 죽은 설정은 자동 정리
+                continue
+            except discord.HTTPException as e:
+                _ERR_STATE["last_error"] = f"조회 실패 HTTP {e.status}"
+                continue
+        if not isinstance(ch, discord.abc.Messageable):
+            continue
+        try:
+            await ch.send(embed=embed)
+            _ERR_STATE["sent"] += 1
+        except discord.HTTPException as e:
+            _ERR_STATE["last_error"] = f"HTTP {e.status}"
+
+
+async def _pump_err_reports() -> None:
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(2.0)
+            if not _ERR_QUEUE:
+                continue
+            if time.time() - _ERR_STATE["last_sent"] < _ERR_MIN_GAP:
+                continue  # 속도 제한 → 다음 사이클로 미룬다
+            item = _ERR_QUEUE.pop(0)
+            _ERR_STATE["last_sent"] = time.time()
+            try:
+                await _deliver_err(item)
+            except Exception as e:
+                _ERR_STATE["last_error"] = str(e)[:200]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # 이 태스크가 죽으면 오류 보고가 영영 안 되므로 절대 죽이지 않는다
+
+
+def _start_err_reports() -> None:
+    global _ERR_TASK
+    if _ERR_TASK is not None and not _ERR_TASK.done():
+        return
+    _ERR_TASK = asyncio.create_task(_pump_err_reports())
+
+
+# 루트 로거에 붙인다 → discord / asyncio / 자기 코드 어디서 나든 다 잡는다.
+logging.getLogger().addHandler(_ErrorReportHandler())
+
+
 # ---------- 이벤트 ----------
 _PANEL_REFRESH_DONE = False
 
@@ -702,6 +901,8 @@ async def on_ready():
         await _refresh_all_panels()
     # 웹(Render)이 직접 못 보낸 인증 로그를 봇 IP 로 대신 전송하도록 띄운다.
     _start_log_pump()
+    # 오류 자동 보고 펌프 (/오류보고)
+    _start_err_reports()
 
 
 @bot.event
@@ -1969,6 +2170,157 @@ async def leave_log_panel(
     await _open_log_panel(interaction, "leave", 로그채널)
 
 
+# ---------- 슬래시 명령: 오류 자동 보고 ----------
+def err_report_embed(guild: discord.Guild) -> discord.Embed:
+    ch_id = get_err_channel(guild.id)
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch_id and ch is None:
+        ch_text = f"<#{ch_id}> (찾을 수 없음 — 다시 지정해주세요)"
+    elif isinstance(ch, discord.TextChannel):
+        ch_text = ch.mention
+    else:
+        ch_text = "❌ 미지정"
+    e = discord.Embed(
+        title="🚨 오류 자동 보고",
+        description=(
+            "봇에서 **오류가 발생하면** 이 채널로 자동 전송돼요.\n"
+            "어느 명령에서 · 어느 줄에서 터졌는지 스택과 함께 옵니다.\n"
+            "호스팅 콘솔은 글자를 못 읽으니 **여기가 확인할 수 있는 유일한 창구**입니다."
+        ),
+        color=discord.Color.red(),
+    )
+    e.add_field(name="보고 채널", value=ch_text, inline=False)
+    e.add_field(
+        name="지금까지",
+        value=(
+            f"전송 **{_ERR_STATE['sent']}건** · 중복 억제 **{_ERR_STATE['suppressed']}건**\n"
+            f"마지막 전송 오류: `{_ERR_STATE['last_error'] or '-'}`"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="동작 규칙",
+        value="같은 오류는 60초에 1회만 · 최소 3초 간격 (스팸·rate limit 방지)",
+        inline=False,
+    )
+    return e
+
+
+class ErrReportView(discord.ui.View):
+    """오류 보고 설정 — /오류보고 로만 열리는 ephemeral 조작판.
+
+    custom_id 고정 → bot.add_view 로 재시작 후에도 유지된다.
+    """
+
+    def __init__(self, guild_id: int | None = None):
+        super().__init__(timeout=None)
+        sel = discord.ui.ChannelSelect(
+            custom_id="errlog:channel",
+            channel_types=[discord.ChannelType.text],
+            placeholder="봇 오류를 받을 채널",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        sel.callback = self._on_channel
+        self.add_item(sel)
+        specs = (
+            ("errlog:test", "🧪 오류 보고 테스트", discord.ButtonStyle.green, self._on_test),
+            ("errlog:clear", "🗑 설정 해제", discord.ButtonStyle.red, self._on_clear),
+        )
+        for cid, label, style, cb in specs:
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=1)
+            b.callback = cb
+            self.add_item(b)
+
+    # discord.py 는 item.callback(interaction) 만 넘긴다 → 값은 interaction.data 에서.
+    @staticmethod
+    def _picked(interaction: discord.Interaction) -> int | None:
+        values = (interaction.data or {}).get("values") or []
+        return int(values[0]) if values else None
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        await interaction.response.edit_message(
+            embed=err_report_embed(guild), view=ErrReportView(guild.id)
+        )
+
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        cid = self._picked(interaction)
+        if guild is None or cid is None:
+            return
+        ch = guild.get_channel(cid)
+        if not isinstance(ch, discord.TextChannel):
+            await _deny(interaction)
+            return
+        set_err_channel(guild.id, ch.id)
+        await self._refresh(interaction)
+        await interaction.followup.send(
+            f"✅ 봇 오류가 나면 {ch.mention} 으로 자동 보고할게요.",
+            ephemeral=True,
+        )
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        set_err_channel(guild.id, None)
+        await self._refresh(interaction)
+        await interaction.followup.send("🗑 오류 자동 보고를 껐어요.", ephemeral=True)
+
+    async def _on_test(self, interaction: discord.Interaction) -> None:
+        """의도적으로 오류 하나를 만들어 보고 경로 전체(수집→큐→전송)를 검증한다."""
+        global _ERR_CTX_GUILD
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not get_err_channel(guild.id):
+            await interaction.response.send_message(
+                "⚠️ 먼저 위에서 보고 채널을 지정해주세요.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        _ERR_CTX_GUILD = guild.id
+        try:
+            raise RuntimeError("오류 보고 테스트 (이 오류는 의도적입니다)")
+        except RuntimeError:
+            log.exception("오류 보고 테스트")
+        _ERR_CTX_GUILD = None
+        await interaction.followup.send(
+            "🧪 오류를 일부러 발생시켰어요. 지정한 채널에 들어갔는지 확인해주세요.\n"
+            "*(수집 2초 + 전송 간격 3초 → 최대 5초 정도 걸려요)*",
+            ephemeral=True,
+        )
+
+
+bot.add_view(ErrReportView())
+
+
+@tree.command(
+    name="오류보고",
+    description="봇 오류 자동 보고 채널 설정 (관리자, 본인 화면에만 뜹니다)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def error_report_panel(interaction: discord.Interaction):
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.send_message(
+        embed=err_report_embed(guild), view=ErrReportView(guild.id), ephemeral=True
+    )
+
+
 @tree.error
 async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
@@ -1990,7 +2342,12 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
         )
     else:
         msg = f"❌ 오류: {error}"
+        # 오류 보고가 "어느 서버에서"였는지 알 수 있게 컨텍스트를 넘긴다.
+        # (로깅 핸들러는 interaction 을 모르므로, 안 넘기면 서버 구분 없이 뿌려진다)
+        global _ERR_CTX_GUILD
+        _ERR_CTX_GUILD = interaction.guild_id
         log.exception("slash error: %s", error)
+        _ERR_CTX_GUILD = None
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
