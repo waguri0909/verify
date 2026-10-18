@@ -874,6 +874,12 @@ async def _refresh_all_panels() -> None:
                     "%s 패널 갱신 guild=%s ok=%s fail=%s miss=%s",
                     name, g.id, ok, fail, missing,
                 )
+        # 3) 허니팟 — 감시 채널이 정해져 있는데 카운터 메시지가 사라졌으면 다시 올린다
+        if (get_honeypot(g.id) or {}).get("channel"):
+            try:
+                await sync_trap_message(g)
+            except Exception:
+                log.exception("허니팟 카운터 동기화 실패 guild=%s", g.id)
 
 
 @bot.event
@@ -2411,28 +2417,35 @@ def honeypot_notice_view(cfg: dict) -> discord.ui.LayoutView:
     box = discord.ui.Container(accent_colour=discord.Color.red())
     box.add_item(discord.ui.TextDisplay(HONEYPOT_NOTICE_TEXT))
     box.add_item(discord.ui.TextDisplay(f"**{HONEYPOT_NOTICE_WARNING}**"))
-    box.add_item(discord.ui.Button(
+    # 컨테이너는 버튼을 '직접' 받지 않는다 (400 Invalid Form Body) —
+    # 액션로우(버튼 줄)로 감싸야 디스코드가 받아준다.
+    row = discord.ui.ActionRow()
+    row.add_item(discord.ui.Button(
         custom_id=HONEYPOT_COUNTER_CUSTOM_ID,
         label=f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {cfg.get('hits') or 0}명",
         style=discord.ButtonStyle.secondary,
         disabled=True,
     ))
+    box.add_item(row)
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(box)
     return view
 
 
-async def sync_trap_message(guild: discord.Guild) -> None:
+async def sync_trap_message(guild: discord.Guild) -> bool:
     """감시 채널의 카운터 메시지를 설정에 맞춰 유지한다.
 
     없으면 새로 올리고, 있으면 내용만 고쳐서 숫자가 올라간 것처럼 보이게 한다.
     (매 적발마다 메시지를 새로 보내면 채널이 쓰레기로 차니까 — 메시지 하나를 계속 고친다)
+
+    리턴값은 '카운터가 채널에 실제로 떠 있는지'다. 전송이 실패해도 무시하고
+    성공한 척 안내하면 사용자가 원인을 못 찾으므로 반드시 확인용으로 돌려준다.
     """
     cfg = get_honeypot(guild.id)
     ch_id = cfg.get("channel")
     ch = guild.get_channel(ch_id) if ch_id else None
     if not isinstance(ch, discord.TextChannel):
-        return
+        return False
     view = honeypot_notice_view(cfg)
     msg_id = cfg.get("msg_id")
     if msg_id:
@@ -2442,14 +2455,14 @@ async def sync_trap_message(guild: discord.Guild) -> None:
             pass  # 지워져 있으면 바로 아래에서 새로 올린다
         except discord.HTTPException as e:
             log.warning("허니팟 메시지 조회 실패 ch=%s err=%s", ch_id, e)
-            return
+            return False
         else:
             # 컨테이너(V2) 메시지는 본문·임베드를 함께 못 쓴다 —
             # 구버전 메시지라면 본문/임베드를 비워주고 view 로 통째로 교체한다.
             patch = {"content": None, "embed": None} if (old.content or old.embeds) else {}
             try:
                 await old.edit(view=view, **patch)
-                return
+                return True
             except discord.HTTPException as e:
                 # 구조가 달라서 못 고쳐지는 경우 — 지우고 새로 올린다
                 log.warning("허니팟 메시지 교체 실패 err=%s — 다시 올림", e)
@@ -2461,8 +2474,9 @@ async def sync_trap_message(guild: discord.Guild) -> None:
         sent = await ch.send(view=view)
     except discord.HTTPException as e:
         log.warning("허니팟 메시지 전송 실패 ch=%s err=%s", ch_id, e)
-        return
+        return False
     set_honeypot(guild.id, msg_id=sent.id)
+    return True
 
 
 async def remove_trap_message(guild: discord.Guild) -> None:
@@ -2680,13 +2694,21 @@ class HoneypotView(discord.ui.View):
             return
         await remove_trap_message(guild)  # 이전 채널의 카운터를 지운다
         set_honeypot(guild.id, channel=ch.id, msg_id=None)
-        await sync_trap_message(guild)  # 새 채널에 카운터를 올려둔다
+        ok = await sync_trap_message(guild)  # 새 채널에 카운터를 올려둔다
         await self._refresh(interaction)
-        await interaction.followup.send(
-            f"🍯 {ch.mention} 채널에 카운터를 올렸어요. "
-            "누가 입력하면 **즉시 삭제 + 제재**되고 숫자가 올라가요.",
-            ephemeral=True,
-        )
+        if ok:
+            await interaction.followup.send(
+                f"🍯 {ch.mention} 채널에 카운터를 올렸어요. "
+                "누가 입력하면 **즉시 삭제 + 제재**되고 숫자가 올라가요.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"⚠️ {ch.mention} 채널에 카운터를 못 올렸어요. "
+                "봇이 그 채널을 **읽고 메시지를 보낼 권한**이 있는지 확인해 주세요. "
+                "제재(삭제+강퇴/타임아웃/차단) 자체는 정상 동작해요.",
+                ephemeral=True,
+            )
 
     async def _set_action(self, interaction: discord.Interaction, action: str) -> None:
         if not _verify_admin_ok(interaction):
