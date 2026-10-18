@@ -2330,6 +2330,12 @@ async def error_report_panel(interaction: discord.Interaction):
 
 HONEYPOT_ACTIONS = ("kick", "timeout", "ban")
 HONEYPOT_ACTION_LABELS = {"kick": "🚪 강퇴", "timeout": "⏱ 타임아웃", "ban": "⛔ 차단"}
+# 채널 경고 메시지에 들어갈 누적 표기 (제재 방식에 맞춰 문구도 바뀐다)
+HONEYPOT_COUNT_LABELS = {
+    "kick": "🚪 강퇴된 계정",
+    "timeout": "⏱ 타임아웃된 계정",
+    "ban": "⛔ 차단된 계정",
+}
 # 타임아웃 기간(분). 디스코드 상한 = 28일 (40320분)
 HONEYPOT_DURATIONS = (10, 30, 60, 360, 1440, 10080, 40320)
 HONEYPOT_MAX_MINUTES = 28 * 24 * 60
@@ -2401,46 +2407,42 @@ async def _honeypot_bust(message: discord.Message, cfg: dict) -> None:
                     getattr(getattr(message, "channel", None), "id", "?"), e)
 
     # 2) 제재
-    label = HONEYPOT_ACTION_LABELS.get(action, action)
     err = ""
     try:
         if action == "kick":
             await member.kick(reason=reason)
-            label = "🚪 강퇴"
         elif action == "ban":
             await guild.ban(member, reason=reason)
-            label = "⛔ 차단"
         else:
             await member.timeout(timedelta(minutes=minutes), reason=reason)
-            label = f"⏱ 타임아웃 ({fmt_minutes(minutes)})"
     except discord.Forbidden:
         err = "권한 부족 — 봇 역할이 대상보다 위에 있어야 하고 강퇴/차단 권한이 필요해요."
     except discord.HTTPException as e:
         err = f"디스코드 응답 오류 HTTP {e.status}"
 
-    # 3) 적발 누적
-    hits = (cfg.get("hits") or 0) + 1
-    try:
-        set_honeypot(guild.id, hits=hits)
-    except Exception:
-        pass
+    # 3) 적발 누적 — 실제로 제재가 먹힌 경우에만 센다 (권한 문제로 실패한 건 횟수에 넣지 않는다)
+    hits = (cfg.get("hits") or 0) + (0 if err else 1)
+    if not err:
+        try:
+            set_honeypot(guild.id, hits=hits)
+        except Exception:
+            pass
 
-    # 4) 알림 — 인증 로그 채널이 지정돼 있으면 거기로도 보낸다.
-    #    (없어도 디스코드 감사 로그에는 강퇴/차단/타임아웃이 자동으로 남는다)
-    e = discord.Embed(
-        title="🍯 허니팟 적발",
-        description=f"{member.mention} 님이 허니팟 채널에 메시지를 보냈어요.\n**조치:** {label}",
-        color=discord.Color.red() if not err else discord.Color.orange(),
+    # 4) 그 채널에 경고 메시지 — 여기가 바로 함정이니 읽는 사람은 물러나게 한다.
+    #    (그 밖의 로그 채널 전송은 하지 않는다. 강퇴/차단/타임아웃은 디스코드 감사 로그에 자동으로 남는다)
+    notice = discord.Embed(
+        title="🍯 허니팟",
+        description=(
+            f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {hits}명\n\n"
+            "⚠️ 이 채널에 채팅을 입력하지 마세요"
+        ),
+        color=discord.Color.red(),
     )
-    e.add_field(name="채널", value=getattr(message.channel, "mention", "-"), inline=True)
-    e.add_field(name="대상", value=f"{member} (`{member.id}`)", inline=True)
-    e.add_field(name="누적 적발", value=f"{hits}회", inline=True)
-    if err:
-        e.add_field(name="조치 실패", value=err, inline=False)
     try:
-        await _send_to_log_channel(guild.id, e.to_dict())
-    except Exception:
-        pass
+        await message.channel.send(embed=notice)
+    except discord.HTTPException as e2:
+        log.warning("허니팟 경고 메시지 전송 실패 ch=%s err=%s",
+                    getattr(message.channel, "id", "?"), e2)
     if err:
         log.warning("허니팟 제재 실패 guild=%s action=%s: %s", guild.id, action, err)
 
@@ -2488,7 +2490,7 @@ def honeypot_embed(guild: discord.Guild) -> discord.Embed:
         description=(
             "지정한 채널에 메시지를 보내면 **바로 지우고** 보낸 사람을 제재해요.\n"
             "메시지 내용은 읽지 않아도 동작해서 별도 인텐트 설정이 필요 없어요.\n"
-            "관리자·스태프는 자동 제외. 적발 내역은 **인증 로그 채널**과 디스코드 **감사 로그**에 남습니다."
+            "잡으면 그 채널에 경고 메시지를 자동으로 띄워요. 관리자·스태프는 자동 제외."
         ),
         color=color,
     )
