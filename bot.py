@@ -2373,12 +2373,13 @@ def get_honeypot(guild_id: int) -> dict:
         cfg["action"] = "timeout"
     cfg["minutes"] = _honeypot_minutes(cfg.get("minutes", 60))
     cfg["hits"] = _hp_int(cfg.get("hits", 0)) or 0
+    cfg["msg_id"] = _hp_int(cfg.get("msg_id"))  # 함정 메시지(카운터)의 ID
     return cfg
 
 
 def set_honeypot(guild_id: int, **fields) -> dict:
     cfg = get_honeypot(guild_id)
-    for key in ("channel", "action", "minutes", "hits"):
+    for key in ("channel", "action", "minutes", "hits", "msg_id"):
         if key in fields:
             cfg[key] = fields[key]
     if cfg.get("action") not in HONEYPOT_ACTIONS:
@@ -2386,8 +2387,70 @@ def set_honeypot(guild_id: int, **fields) -> dict:
     cfg["channel"] = _hp_int(cfg.get("channel"))
     cfg["minutes"] = _honeypot_minutes(cfg.get("minutes"))
     cfg["hits"] = _hp_int(cfg.get("hits")) or 0
+    cfg["msg_id"] = _hp_int(cfg.get("msg_id"))
     _put_guild_setting(guild_id, "honeypot", cfg)
     return cfg
+
+
+def honeypot_notice_embed(cfg: dict) -> discord.Embed:
+    """감시 채널에 띄워두는 카운터 메시지."""
+    action = cfg.get("action", "timeout")
+    return discord.Embed(
+        title="🍯 허니팟",
+        description=(
+            f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {cfg.get('hits') or 0}명\n\n"
+            "⚠️ 이 채널에 채팅을 입력하지 마세요"
+        ),
+        color=discord.Color.red(),
+    )
+
+
+async def sync_trap_message(guild: discord.Guild) -> None:
+    """감시 채널의 카운터 메시지를 설정에 맞춰 유지한다.
+
+    없으면 새로 올리고, 있으면 내용만 고쳐서 숫자가 올라간 것처럼 보이게 한다.
+    (매 적발마다 메시지를 새로 보내면 채널이 쓰레기로 차니까 — 메시지 하나를 계속 고친다)
+    """
+    cfg = get_honeypot(guild.id)
+    ch_id = cfg.get("channel")
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if not isinstance(ch, discord.TextChannel):
+        return
+    msg_id = cfg.get("msg_id")
+    if msg_id:
+        try:
+            old = await ch.fetch_message(msg_id)
+        except discord.NotFound:
+            msg_id = None  # 지워져 있으면 새로 올린다
+        except discord.HTTPException as e:
+            log.warning("허니팟 메시지 조회 실패 ch=%s err=%s", ch_id, e)
+            return
+        else:
+            try:
+                await old.edit(embed=honeypot_notice_embed(cfg))
+            except discord.HTTPException as e:
+                log.warning("허니팟 메시지 수정 실패 err=%s", e)
+            return
+    try:
+        sent = await ch.send(embed=honeypot_notice_embed(cfg))
+    except discord.HTTPException as e:
+        log.warning("허니팟 메시지 전송 실패 ch=%s err=%s", ch_id, e)
+        return
+    set_honeypot(guild.id, msg_id=sent.id)
+
+
+async def remove_trap_message(guild: discord.Guild) -> None:
+    """감시 채널의 카운터 메시지를 지운다 (채널 바꾸거나 감시를 끌 때)."""
+    cfg = get_honeypot(guild.id)
+    ch_id = cfg.get("channel")
+    msg_id = cfg.get("msg_id")
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if msg_id and isinstance(ch, discord.TextChannel):
+        try:
+            await (await ch.fetch_message(msg_id)).delete()
+        except discord.HTTPException:
+            pass  # 이미 지워졌거나 권한이 없으면 그냥 넘어간다
+    set_honeypot(guild.id, msg_id=None)
 
 
 async def _honeypot_bust(message: discord.Message, cfg: dict) -> None:
@@ -2428,21 +2491,12 @@ async def _honeypot_bust(message: discord.Message, cfg: dict) -> None:
         except Exception:
             pass
 
-    # 4) 그 채널에 경고 메시지 — 여기가 바로 함정이니 읽는 사람은 물러나게 한다.
+    # 4) 채널의 카운터 메시지 숫자만 올린다 — 매번 새로 보내지 않는다.
     #    (그 밖의 로그 채널 전송은 하지 않는다. 강퇴/차단/타임아웃은 디스코드 감사 로그에 자동으로 남는다)
-    notice = discord.Embed(
-        title="🍯 허니팟",
-        description=(
-            f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {hits}명\n\n"
-            "⚠️ 이 채널에 채팅을 입력하지 마세요"
-        ),
-        color=discord.Color.red(),
-    )
     try:
-        await message.channel.send(embed=notice)
+        await sync_trap_message(guild)
     except discord.HTTPException as e2:
-        log.warning("허니팟 경고 메시지 전송 실패 ch=%s err=%s",
-                    getattr(message.channel, "id", "?"), e2)
+        log.warning("허니팟 카운터 갱신 실패 err=%s", e2)
     if err:
         log.warning("허니팟 제재 실패 guild=%s action=%s: %s", guild.id, action, err)
 
@@ -2488,9 +2542,10 @@ def honeypot_embed(guild: discord.Guild) -> discord.Embed:
     e = discord.Embed(
         title="🍯 허니팟",
         description=(
-            "지정한 채널에 메시지를 보내면 **바로 지우고** 보낸 사람을 제재해요.\n"
-            "메시지 내용은 읽지 않아도 동작해서 별도 인텐트 설정이 필요 없어요.\n"
-            "잡으면 그 채널에 경고 메시지를 자동으로 띄워요. 관리자·스태프는 자동 제외."
+            "채널을 지정하면 그 채널에 **카운터 메시지**를 올려두고, 누가 입력하면 "
+            "**바로 지우고** 제재해요. 잡은 사람 숫자가 그 메시지에 그대로 올라가요.\n"
+            "메시지 내용은 읽지 않아도 동작해서 별도 인텐트 설정이 필요 없어요. "
+            "관리자·스태프는 자동 제외."
         ),
         color=color,
     )
@@ -2498,7 +2553,10 @@ def honeypot_embed(guild: discord.Guild) -> discord.Embed:
     e.add_field(name="대상 채널", value=ch_text, inline=False)
     e.add_field(name="제재 방식", value=HONEYPOT_ACTION_LABELS[cfg["action"]], inline=True)
     e.add_field(name="타임아웃 기간", value=fmt_minutes(cfg["minutes"]), inline=True)
-    e.add_field(name="누적 적발", value=f"{cfg['hits']}회", inline=True)
+    e.add_field(name="누적 적발", value=f"{cfg['hits']}명", inline=True)
+    e.add_field(name="카운터 메시지",
+                value="🟢 올려짐" if cfg.get("msg_id") else "❌ 없음",
+                inline=True)
     return e
 
 
@@ -2594,11 +2652,13 @@ class HoneypotView(discord.ui.View):
         if not isinstance(ch, discord.TextChannel):
             await _deny(interaction)
             return
-        set_honeypot(guild.id, channel=ch.id)
+        await remove_trap_message(guild)  # 이전 채널의 카운터를 지운다
+        set_honeypot(guild.id, channel=ch.id, msg_id=None)
+        await sync_trap_message(guild)  # 새 채널에 카운터를 올려둔다
         await self._refresh(interaction)
         await interaction.followup.send(
-            f"🍯 {ch.mention} 채널을 감시하기 시작했어요. "
-            "메시지를 보내면 **즉시 삭제 + 제재**됩니다.",
+            f"🍯 {ch.mention} 채널에 카운터를 올렸어요. "
+            "누가 입력하면 **즉시 삭제 + 제재**되고 숫자가 올라가요.",
             ephemeral=True,
         )
 
@@ -2610,6 +2670,7 @@ class HoneypotView(discord.ui.View):
         if guild is None:
             return
         set_honeypot(guild.id, action=action)
+        await sync_trap_message(guild)  # 카운터 문구도 제재 방식에 맞춰 바꾼다
         await self._refresh(interaction)
         await interaction.followup.send(
             f"✅ 제재 방식을 **{HONEYPOT_ACTION_LABELS[action]}**(으)로 바꿨어요.",
@@ -2646,7 +2707,8 @@ class HoneypotView(discord.ui.View):
         guild = interaction.guild
         if guild is None:
             return
-        set_honeypot(guild.id, channel=None)
+        await remove_trap_message(guild)  # 카운터 메시지도 같이 지운다
+        set_honeypot(guild.id, channel=None, msg_id=None)
         await self._refresh(interaction)
         await interaction.followup.send("🔕 허니팟 감시를 껐어요.", ephemeral=True)
 
