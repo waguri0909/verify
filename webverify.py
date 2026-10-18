@@ -356,6 +356,27 @@ def save_tokens(user_id: str, guild_id: int, access: str, refresh: str, expires_
         con.close()
 
 
+def clear_tokens(guild_id: int, keep: list[str] | None = None) -> int:
+    """복구에 쓴 백업 토큰을 지운다. keep 에 든 user_id 는 남긴다. 지운 개수 반환."""
+    con = db()
+    try:
+        keep_ids = [str(u) for u in (keep or []) if str(u)]
+        if keep_ids:
+            ph = ",".join("?" * len(keep_ids))
+            cur = con.execute(
+                f"DELETE FROM oauth_tokens WHERE guild_id=? AND user_id NOT IN ({ph})",
+                (str(guild_id), *keep_ids),
+            )
+        else:
+            cur = con.execute(
+                "DELETE FROM oauth_tokens WHERE guild_id=?", (str(guild_id),)
+            )
+        con.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        con.close()
+
+
 def get_backed_users(guild_id: int) -> list[tuple]:
     """(user_id, access, refresh, expires_at) 목록."""
     con = db()
@@ -822,6 +843,25 @@ async def api_token_save(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def api_token_clear(request: web.Request) -> web.Response:
+    """복구를 마친 뒤 백업 토큰을 비운다.
+
+    안 지우면 복구를 써도 백업 인원수가 그대로 남아서 '안 줄어든다'고 보인다.
+    keep 에 든 user_id 는 남긴다 — 복구 중 실패(일시 오류/레이트리밋)한 사람이라
+    재시도로 건질 수 있기 때문이다. keep 이 비면 전부 지워서 0명이 된다.
+    """
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        body = await request.json()
+        guild_id = int(body["guild"])
+        keep = [str(u) for u in (body.get("keep") or [])]
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        return web.json_response({"detail": f"입력 오류: {e}"}, status=400)
+    removed = clear_tokens(guild_id, keep)
+    return web.json_response({"ok": True, "removed": removed, "left": len(keep)})
+
+
 # ---------- 라우트 ----------
 async def index(request: web.Request) -> web.Response:
     try:
@@ -1050,4 +1090,5 @@ def create_app() -> web.Application:
     app.router.add_get("/api/backup-count", api_backup_count)
     app.router.add_get("/api/backup-users", api_backup_users)
     app.router.add_post("/api/token-save", api_token_save)
+    app.router.add_post("/api/token-clear", api_token_clear)
     return app

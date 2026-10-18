@@ -117,3 +117,15 @@ async def token_save(user_id: str, guild_id: int, access: str, refresh: str, exp
               "refresh": refresh, "expires_in": expires_in},
     )
     return bool(d.get("ok"))
+
+
+async def token_clear(guild_id: int, keep: list[str] | None = None) -> int:
+    """복구 완료 후 백업 토큰을 비운다. 정리 후 남은 인원 수를 돌려준다.
+
+    keep 은 복구에 실패한 user_id 목록 — 남겨둬야 재시도로 건질 수 있다.
+    """
+    d = await _req(
+        "POST", "/api/token-clear",
+        json={"guild": guild_id, "keep": [str(u) for u in (keep or [])]},
+    )
+    return int(d.get("left", 0))

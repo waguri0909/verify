@@ -175,6 +175,9 @@ async def run_restore(
     users = await webapi.backup_users(source_guild)
     total = len(users)
     res = {"total": total, "ok": 0, "already": 0, "dead": 0, "fail": 0}
+    # 복구에 실패한 사람만 남긴다 — 지워버리면 재시도로 못 건진다.
+    # (성공/이미있음/토큰죽음 은 지워서 백업 수가 줄어들게 한다)
+    keep: list[str] = []
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
         for i, u in enumerate(users, 1):
@@ -201,7 +204,18 @@ async def run_restore(
                 st = await add_member(s, target_guild, uid, access)
                 if st != "rate":
                     break
+            if st in ("rate", "fail"):
+                keep.append(uid)
             res[st if st in res else "fail"] += 1
             await asyncio.sleep(1.2)  # 멤버추가 레이트리밋 준수
             await progress_cb(i, total)
+    # 복구에 쓴 백업 토큰을 비운다 — 안 하면 복구를 써도 인원수가 그대로 남는다.
+    # 웹이 아직 구버전이거나 안 떠있어도 복구 결과 자체는 낼 수 있어야 하므로
+    # 실패해도 그냥 넘어간다.
+    res["kept"] = len(keep)
+    try:
+        res["left"] = await webapi.token_clear(source_guild, keep)
+    except Exception as e:
+        log.warning("백업 토큰 정리 실패 guild=%s err=%s", source_guild, e)
+        res["left"] = None
     return res

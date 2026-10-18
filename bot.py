@@ -1611,12 +1611,20 @@ class RecoverConfirmView(discord.ui.View):
                     pass
 
         res = await recover.run_restore(guild.id, gid, progress)
+        left = res.get("left")
+        if left is None:
+            left_line = "- 남은 백업: ⚠️ 정리 실패(웹 미연결) — 나중에 복구를 한 번 더 눌러 정리돼요"
+        elif left > 0:
+            left_line = f"- 남은 백업: **{left}명** (복구 실패분 — [♻️ 복구 실행] 재시도로 가능)"
+        else:
+            left_line = "- 남은 백업: **0명** (백업 초기화 완료)"
         summary = (
             f"✅ 복구 완료: {total}명 중\n"
             f"- 새로 초대: {res['ok']}명\n"
             f"- 이미 있음: {res['already']}명\n"
-            f"- 토큰 만료/취소: {res['dead']}명 (재인증 필요)\n"
-            f"- 실패: {res['fail']}명"
+            f"- 토큰 만료/취소: {res['dead']}명 (백업 제외, 재인증하면 다시 쌓임)\n"
+            f"- 실패: {res['fail']}명\n"
+            f"{left_line}"
         )
         await msg.edit(content=summary)
         await send_log(guild, f"🔑 **복구 실행** (by {interaction.user.mention})\n{summary}")
