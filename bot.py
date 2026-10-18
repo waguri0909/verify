@@ -1826,7 +1826,7 @@ class VerifyAdminView(discord.ui.View):
     """인증 관리 패널 — /인증관리 명령으로만 열리는 ephemeral 뷰.
 
     위 두 줄(RoleSelect)으로 지급/미인증 역할을 그자리에서 지정하고,
-    버튼으로 인증 초기화·웹훅·복구키·패널 색상을 다룬다.
+    버튼으로 인증 초기화·복구키(현재 쓰는 키 / DM 발급 / 설정 / 삭제 / 실행)·패널 색상을 다룬다.
     (마지막 줄 = 패널 왼쪽 바 색상 프리셋/직접 입력)
     custom_id 고정 → bot.add_view 로 영구 유지.
     채널에 게시되는 메시지에는 절대 붙지 않으므로 유저는 볼 수 없다.
@@ -1854,6 +1854,8 @@ class VerifyAdminView(discord.ui.View):
         specs = [
             ("verify:admin:reset", "🔄 인증 초기화",
              discord.ButtonStyle.secondary, self._reset, 2),
+            ("verify:recover:current", "🔑 현재 복구키",
+             discord.ButtonStyle.primary, self._recover_current, 2),
             ("verify:recover:key", "🔑 복구키 확인",
              discord.ButtonStyle.secondary, self._recover_key, 3),
             ("verify:recover:set", "✏️ 키 설정",
@@ -1983,6 +1985,32 @@ class VerifyAdminView(discord.ui.View):
                 f"⚠️ DM이 막혀 있어 여기에 표시합니다. 확인 후 이 메시지를 지우세요.\n{text}",
                 ephemeral=True,
             )
+
+    async def _recover_current(self, interaction: discord.Interaction) -> None:
+        """지금 인증할 때마다 사람들이 쌓이고 있는 복구키 자체를 화면에 보여준다.
+
+        토큰은 guild_id 기준(webverify.save_tokens)으로 쌓이고 recovery_keys 가
+        guild_id -> key 를 맡으므로 get_key/ensure_key 가 바로 '지금 쓰는 키'다.
+        (DM 으로 빼내는 기존 버튼과 달리 여기는 본인 화면에 바로 띄운다)
+        """
+        guild = interaction.guild
+        if guild is None:
+            return
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        key, is_new = recover.ensure_key(guild.id, interaction.user.id)
+        lines = [
+            f"🔑 **{guild.name} — 지금 쓰고 있는 복구키**",
+            f"`{key}`",
+            "",
+            "• 웹 인증이 끝날 때마다 **이 키 앞으로** 그 사람의 토큰이 쌓여요.",
+            f"• 서버를 잃어도 새 서버에서 `/복구 키:{key}` 로 전원 재초대할 수 있어요.",
+        ]
+        if is_new:
+            lines.append("• 아직 키가 없어 방금 새로 발급했어요 — 여기부터 쌓입니다.")
+        lines.append("⚠️ **본인 화면에만** 뜨는 메시지예요. 남에게 공유하지 마세요.")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     async def _recover_run(self, interaction: discord.Interaction) -> None:
         if not _verify_admin_ok(interaction):
