@@ -2336,10 +2336,11 @@ HONEYPOT_COUNT_LABELS = {
     "timeout": "⏱ 타임아웃된 계정",
     "ban": "⛔ 차단된 계정",
 }
-# 감시 채널에 띄워두는 안내 본문.
+# 감시 채널에 띄워두는 안내.
 # '# 제목' 헤드라인 마크다운은 임베드가 아니라 메시지 본문에서만 지원된다 —
-# 임베드 제목은 작아서 잘 안 보이므로 본문으로 빼서 크게 쓴다.
-HONEYPOT_NOTICE_TEXT = "# 🍯 허니팟\n**⚠️ 이 채널에 채팅을 입력하지 마세요**"
+# 제목은 본문으로 빼서 크게 쓰고, 주의 문구는 임베드(빨간 바)에 넣는다.
+HONEYPOT_NOTICE_TEXT = "# 🍯 허니팟"
+HONEYPOT_NOTICE_WARNING = "⚠️ 이 채널에 채팅을 입력하지 마세요"
 # 타임아웃 기간(분). 디스코드 상한 = 28일 (40320분)
 HONEYPOT_DURATIONS = (10, 30, 60, 360, 1440, 10080, 40320)
 HONEYPOT_MAX_MINUTES = 28 * 24 * 60
@@ -2396,6 +2397,14 @@ def set_honeypot(guild_id: int, **fields) -> dict:
     return cfg
 
 
+def honeypot_notice_embed() -> discord.Embed:
+    """주의 문구가 든 임베드 — 본문 헤드라인 바로 아래에 빨간 바로 붙는다."""
+    return discord.Embed(
+        description=HONEYPOT_NOTICE_WARNING,
+        color=discord.Color.red(),
+    )
+
+
 def honeypot_counter_view(cfg: dict) -> discord.ui.View:
     """제재 횟수를 담은 버튼 — 눌리지 않도록 disabled 로 만든다 (표시용일 뿐).
 
@@ -2434,13 +2443,14 @@ async def sync_trap_message(guild: discord.Guild) -> None:
             return
         else:
             try:
-                # embed=None → 옛날 임베드 형태였다면 함께 없앤다
-                await old.edit(content=HONEYPOT_NOTICE_TEXT, embed=None, view=view)
+                await old.edit(content=HONEYPOT_NOTICE_TEXT,
+                               embed=honeypot_notice_embed(), view=view)
             except discord.HTTPException as e:
                 log.warning("허니팟 메시지 수정 실패 err=%s", e)
             return
     try:
-        sent = await ch.send(content=HONEYPOT_NOTICE_TEXT, view=view)
+        sent = await ch.send(content=HONEYPOT_NOTICE_TEXT,
+                             embed=honeypot_notice_embed(), view=view)
     except discord.HTTPException as e:
         log.warning("허니팟 메시지 전송 실패 ch=%s err=%s", ch_id, e)
         return
