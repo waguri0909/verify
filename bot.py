@@ -2393,16 +2393,24 @@ def set_honeypot(guild_id: int, **fields) -> dict:
 
 
 def honeypot_notice_embed(cfg: dict) -> discord.Embed:
-    """감시 채널에 띄워두는 카운터 메시지."""
+    """감시 채널에 띄워두는 카운터 메시지.
+
+    제재 횟수와 주의 문구를 임베드 **필드**로 넣는다 — 필드에만 배경 상자가 생겨서
+    전부 설명 텍스트로 적었을 때보다 눈에 훨씬 잘 들어온다.
+    """
     action = cfg.get("action", "timeout")
-    return discord.Embed(
-        title="🍯 허니팟",
-        description=(
-            f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {cfg.get('hits') or 0}명\n\n"
-            "⚠️ 이 채널에 채팅을 입력하지 마세요"
-        ),
-        color=discord.Color.red(),
+    e = discord.Embed(title="🍯 허니팟", color=discord.Color.red())
+    e.add_field(
+        name=HONEYPOT_COUNT_LABELS.get(action, action),
+        value=f"**{cfg.get('hits') or 0}명**",
+        inline=True,
     )
+    e.add_field(
+        name="⚠️ 주의",
+        value="이 채널에 채팅을 입력하지 마세요",
+        inline=False,
+    )
+    return e
 
 
 async def sync_trap_message(guild: discord.Guild) -> None:
