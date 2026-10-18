@@ -2336,11 +2336,15 @@ HONEYPOT_COUNT_LABELS = {
     "timeout": "⏱ 타임아웃된 계정",
     "ban": "⛔ 차단된 계정",
 }
-# 감시 채널에 띄워두는 안내.
-# '# 제목' 헤드라인 마크다운은 임베드가 아니라 메시지 본문에서만 지원된다 —
-# 제목은 본문으로 빼서 크게 쓰고, 주의 문구는 임베드(빨간 바)에 넣는다.
+# 감시 채널에 띄워두는 카운터 메시지.
+# '# 제목' 헤드라인 마크다운은 임베드가 아니라 본문 계열에서만 커지는데,
+# 디스코드의 '컨테이너'(V2 메시지)는 임베드와 달리 헤드라인·주의 문구·버튼까지
+# 한 상자 안에 모두 들어가서 떨어져 보이지 않는다 — 그래서 임베드 대신 컨테이너를 쓴다.
 HONEYPOT_NOTICE_TEXT = "# 🍯 허니팟"
 HONEYPOT_NOTICE_WARNING = "⚠️ 이 채널에 채팅을 입력하지 마세요"
+# 버튼은 비활성이라 눌리지 않는다. custom_id 를 고정해두는 건
+# 재수정할 때마다 뷰 저장소가 무한정 늘어나는 걸 막기 위해서다.
+HONEYPOT_COUNTER_CUSTOM_ID = "honeypot:counter"
 # 타임아웃 기간(분). 디스코드 상한 = 28일 (40320분)
 HONEYPOT_DURATIONS = (10, 30, 60, 360, 1440, 10080, 40320)
 HONEYPOT_MAX_MINUTES = 28 * 24 * 60
@@ -2397,27 +2401,25 @@ def set_honeypot(guild_id: int, **fields) -> dict:
     return cfg
 
 
-def honeypot_notice_embed() -> discord.Embed:
-    """주의 문구가 든 임베드 — 본문 헤드라인 바로 아래에 빨간 바로 붙는다."""
-    return discord.Embed(
-        description=HONEYPOT_NOTICE_WARNING,
-        color=discord.Color.red(),
-    )
+def honeypot_notice_view(cfg: dict) -> discord.ui.LayoutView:
+    """제재 횟수 카운터 메시지 — 헤드라인·주의 문구·버튼을 전부 컨테이너 안에 넣는다.
 
-
-def honeypot_counter_view(cfg: dict) -> discord.ui.View:
-    """제재 횟수를 담은 버튼 — 눌리지 않도록 disabled 로 만든다 (표시용일 뿐).
-
-    임베드 필드보다 눈에 잘 들어오고, 숫자가 올라갈 때마다 같이 바뀐다.
+    컨테이너는 임베드와 달리 안에 텍스트와 컴포넌트를 함께 담을 수 있어서
+    세 요소가 한 상자로 뭉쳐 보인다. 버튼은 disabled 라 눌리지 않는다.
     """
     action = cfg.get("action", "timeout")
-    v = discord.ui.View()
-    v.add_item(discord.ui.Button(
+    box = discord.ui.Container(accent_colour=discord.Color.red())
+    box.add_item(discord.ui.TextDisplay(HONEYPOT_NOTICE_TEXT))
+    box.add_item(discord.ui.TextDisplay(f"**{HONEYPOT_NOTICE_WARNING}**"))
+    box.add_item(discord.ui.Button(
+        custom_id=HONEYPOT_COUNTER_CUSTOM_ID,
         label=f"{HONEYPOT_COUNT_LABELS.get(action, action)} · {cfg.get('hits') or 0}명",
         style=discord.ButtonStyle.secondary,
         disabled=True,
     ))
-    return v
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(box)
+    return view
 
 
 async def sync_trap_message(guild: discord.Guild) -> None:
@@ -2431,26 +2433,32 @@ async def sync_trap_message(guild: discord.Guild) -> None:
     ch = guild.get_channel(ch_id) if ch_id else None
     if not isinstance(ch, discord.TextChannel):
         return
-    view = honeypot_counter_view(cfg)
+    view = honeypot_notice_view(cfg)
     msg_id = cfg.get("msg_id")
     if msg_id:
         try:
             old = await ch.fetch_message(msg_id)
         except discord.NotFound:
-            msg_id = None  # 지워져 있으면 새로 올린다
+            pass  # 지워져 있으면 바로 아래에서 새로 올린다
         except discord.HTTPException as e:
             log.warning("허니팟 메시지 조회 실패 ch=%s err=%s", ch_id, e)
             return
         else:
+            # 컨테이너(V2) 메시지는 본문·임베드를 함께 못 쓴다 —
+            # 구버전 메시지라면 본문/임베드를 비워주고 view 로 통째로 교체한다.
+            patch = {"content": None, "embed": None} if (old.content or old.embeds) else {}
             try:
-                await old.edit(content=HONEYPOT_NOTICE_TEXT,
-                               embed=honeypot_notice_embed(), view=view)
+                await old.edit(view=view, **patch)
+                return
             except discord.HTTPException as e:
-                log.warning("허니팟 메시지 수정 실패 err=%s", e)
-            return
+                # 구조가 달라서 못 고쳐지는 경우 — 지우고 새로 올린다
+                log.warning("허니팟 메시지 교체 실패 err=%s — 다시 올림", e)
+                try:
+                    await old.delete()
+                except discord.HTTPException:
+                    pass
     try:
-        sent = await ch.send(content=HONEYPOT_NOTICE_TEXT,
-                             embed=honeypot_notice_embed(), view=view)
+        sent = await ch.send(view=view)
     except discord.HTTPException as e:
         log.warning("허니팟 메시지 전송 실패 ch=%s err=%s", ch_id, e)
         return
