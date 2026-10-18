@@ -20,7 +20,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote as url_quote
 
@@ -2318,6 +2318,350 @@ async def error_report_panel(interaction: discord.Interaction):
     assert guild is not None
     await interaction.response.send_message(
         embed=err_report_embed(guild), view=ErrReportView(guild.id), ephemeral=True
+    )
+
+
+# ---------- 허니팟 (허수아비 채널) ----------
+# 지정한 채널에 메시지를 보내면 → **바로 지우고** 보낸 사람을 제재한다.
+# 강퇴 / 타임아웃 / 차단 중 하나를 고르고, 타임아웃이면 기간도 정한다.
+#
+# 메시지 **내용**은 아예 읽지 않는다 (누가 어느 채널에 보냈는지만 알면 되므로
+# message_content 특권 인텐트 없이도 정상 동작 — 포털 설정을 건드리지 않는다).
+
+HONEYPOT_ACTIONS = ("kick", "timeout", "ban")
+HONEYPOT_ACTION_LABELS = {"kick": "🚪 강퇴", "timeout": "⏱ 타임아웃", "ban": "⛔ 차단"}
+# 타임아웃 기간(분). 디스코드 상한 = 28일 (40320분)
+HONEYPOT_DURATIONS = (10, 30, 60, 360, 1440, 10080, 40320)
+HONEYPOT_MAX_MINUTES = 28 * 24 * 60
+
+
+def _hp_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _honeypot_minutes(value) -> int:
+    v = _hp_int(value)
+    if v is None:
+        v = 60
+    return max(1, min(HONEYPOT_MAX_MINUTES, v))
+
+
+def fmt_minutes(minutes) -> str:
+    m = _honeypot_minutes(minutes)
+    if m % 1440 == 0:
+        return f"{m // 1440}일"
+    if m % 60 == 0:
+        return f"{m // 60}시간"
+    return f"{m}분"
+
+
+def get_honeypot(guild_id: int) -> dict:
+    """허니팟 설정. 값이 비어있어도 항상 쓸 수 있는 형태로 돌려준다."""
+    raw = get_guild_roles(guild_id).get("honeypot")
+    cfg = dict(raw) if isinstance(raw, dict) else {}
+    cfg["channel"] = _hp_int(cfg.get("channel"))
+    if cfg.get("action") not in HONEYPOT_ACTIONS:
+        cfg["action"] = "timeout"
+    cfg["minutes"] = _honeypot_minutes(cfg.get("minutes", 60))
+    cfg["hits"] = _hp_int(cfg.get("hits", 0)) or 0
+    return cfg
+
+
+def set_honeypot(guild_id: int, **fields) -> dict:
+    cfg = get_honeypot(guild_id)
+    for key in ("channel", "action", "minutes", "hits"):
+        if key in fields:
+            cfg[key] = fields[key]
+    if cfg.get("action") not in HONEYPOT_ACTIONS:
+        cfg["action"] = "timeout"
+    cfg["channel"] = _hp_int(cfg.get("channel"))
+    cfg["minutes"] = _honeypot_minutes(cfg.get("minutes"))
+    cfg["hits"] = _hp_int(cfg.get("hits")) or 0
+    _put_guild_setting(guild_id, "honeypot", cfg)
+    return cfg
+
+
+async def _honeypot_bust(message: discord.Message, cfg: dict) -> None:
+    """메시지를 지우고 보낸 사람을 제재한다. 실패해도 루프는 살려둔다."""
+    guild = message.guild
+    member = message.author
+    assert guild is not None
+    action = cfg.get("action", "timeout")
+    minutes = _honeypot_minutes(cfg.get("minutes", 60))
+    reason = "허니팟 채널에 메시지를 보냄"
+
+    # 1) 메시지부터 지운다 — 남아있으면 안 된다
+    try:
+        await message.delete()
+    except discord.HTTPException as e:
+        log.warning("허니팟 메시지 삭제 실패 ch=%s err=%s",
+                    getattr(getattr(message, "channel", None), "id", "?"), e)
+
+    # 2) 제재
+    label = HONEYPOT_ACTION_LABELS.get(action, action)
+    err = ""
+    try:
+        if action == "kick":
+            await member.kick(reason=reason)
+            label = "🚪 강퇴"
+        elif action == "ban":
+            await guild.ban(member, reason=reason)
+            label = "⛔ 차단"
+        else:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+            label = f"⏱ 타임아웃 ({fmt_minutes(minutes)})"
+    except discord.Forbidden:
+        err = "권한 부족 — 봇 역할이 대상보다 위에 있어야 하고 강퇴/차단 권한이 필요해요."
+    except discord.HTTPException as e:
+        err = f"디스코드 응답 오류 HTTP {e.status}"
+
+    # 3) 적발 누적
+    hits = (cfg.get("hits") or 0) + 1
+    try:
+        set_honeypot(guild.id, hits=hits)
+    except Exception:
+        pass
+
+    # 4) 알림 — 인증 로그 채널이 지정돼 있으면 거기로도 보낸다.
+    #    (없어도 디스코드 감사 로그에는 강퇴/차단/타임아웃이 자동으로 남는다)
+    e = discord.Embed(
+        title="🍯 허니팟 적발",
+        description=f"{member.mention} 님이 허니팟 채널에 메시지를 보냈어요.\n**조치:** {label}",
+        color=discord.Color.red() if not err else discord.Color.orange(),
+    )
+    e.add_field(name="채널", value=getattr(message.channel, "mention", "-"), inline=True)
+    e.add_field(name="대상", value=f"{member} (`{member.id}`)", inline=True)
+    e.add_field(name="누적 적발", value=f"{hits}회", inline=True)
+    if err:
+        e.add_field(name="조치 실패", value=err, inline=False)
+    try:
+        await _send_to_log_channel(guild.id, e.to_dict())
+    except Exception:
+        pass
+    if err:
+        log.warning("허니팟 제재 실패 guild=%s action=%s: %s", guild.id, action, err)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """허니팟 감지. 메시지 내용은 보지 않고 채널과 발신자만 본다."""
+    if message.guild is None:
+        return
+    if getattr(message, "webhook_id", None):
+        return
+    author = message.author
+    if getattr(author, "bot", False):
+        return
+    cfg = get_honeypot(message.guild.id)
+    channel_id = cfg.get("channel")
+    if not channel_id or channel_id != getattr(message.channel, "id", None):
+        return
+    if not isinstance(author, discord.Member):
+        return
+    perms = author.guild_permissions
+    if perms.administrator or perms.manage_guild or perms.manage_messages:
+        return  # 관리자·스태프는 유인 채널을 써도 제재하지 않는다
+    await _honeypot_bust(message, cfg)
+
+
+def honeypot_embed(guild: discord.Guild) -> discord.Embed:
+    cfg = get_honeypot(guild.id)
+    ch_id = cfg.get("channel")
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch_id and ch is None:
+        ch_text = f"<#{ch_id}> (찾을 수 없음 — 다시 지정해주세요)"
+        state = "⚠️ 채널 사라짐"
+        color = discord.Color.orange()
+    elif ch is not None:
+        ch_text = ch.mention
+        state = "🟢 켜짐"
+        color = discord.Color.red()
+    else:
+        ch_text = "❌ 미지정 — **꺼짐**"
+        state = "🔴 꺼짐"
+        color = discord.Color.blurple()
+    e = discord.Embed(
+        title="🍯 허니팟",
+        description=(
+            "지정한 채널에 메시지를 보내면 **바로 지우고** 보낸 사람을 제재해요.\n"
+            "메시지 내용은 읽지 않아도 동작해서 별도 인텐트 설정이 필요 없어요.\n"
+            "관리자·스태프는 자동 제외. 적발 내역은 **인증 로그 채널**과 디스코드 **감사 로그**에 남습니다."
+        ),
+        color=color,
+    )
+    e.add_field(name="상태", value=state, inline=True)
+    e.add_field(name="대상 채널", value=ch_text, inline=False)
+    e.add_field(name="제재 방식", value=HONEYPOT_ACTION_LABELS[cfg["action"]], inline=True)
+    e.add_field(name="타임아웃 기간", value=fmt_minutes(cfg["minutes"]), inline=True)
+    e.add_field(name="누적 적발", value=f"{cfg['hits']}회", inline=True)
+    return e
+
+
+class HoneypotView(discord.ui.View):
+    """허니팟 설정 — /허니팟 으로만 열리는 ephemeral 조작판.
+
+    custom_id 고정 + timeout=None → bot.add_view 로 재시작 후에도 유지된다.
+    """
+
+    def __init__(self, guild_id: int | None = None):
+        super().__init__(timeout=None)
+        cfg = get_honeypot(guild_id) if guild_id else {}
+
+        sel = discord.ui.ChannelSelect(
+            custom_id="honeypot:channel",
+            channel_types=[discord.ChannelType.text],
+            placeholder="감시할 채널 지정",
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        sel.callback = self._on_channel
+        self.add_item(sel)
+
+        for cid, label, act, cb in (
+            ("honeypot:kick", "🚪 강퇴", "kick", self._on_kick),
+            ("honeypot:timeout", "⏱ 타임아웃", "timeout", self._on_timeout),
+            ("honeypot:ban", "⛔ 차단", "ban", self._on_ban),
+        ):
+            style = (
+                discord.ButtonStyle.primary
+                if cfg.get("action") == act
+                else discord.ButtonStyle.secondary
+            )
+            b = discord.ui.Button(custom_id=cid, label=label, style=style, row=1)
+            b.callback = cb
+            self.add_item(b)
+
+        # 2행: 타임아웃 기간 (지금 값을 ✔ 로 표시)
+        dur = discord.ui.Select(
+            custom_id="honeypot:duration",
+            placeholder="타임아웃 기간",
+            min_values=1,
+            max_values=1,
+            row=2,
+        )
+        cur = int(cfg.get("minutes", 60)) if cfg else 60
+        options = list(HONEYPOT_DURATIONS)
+        if cur not in options:
+            options.insert(0, cur)
+        for m in options:
+            dur.append_option(
+                discord.SelectOption(
+                    label=(f"✔️ {fmt_minutes(m)}" if m == cur else fmt_minutes(m)),
+                    value=str(m),
+                )
+            )
+        dur.callback = self._on_duration
+        self.add_item(dur)
+
+        clear = discord.ui.Button(
+            custom_id="honeypot:clear",
+            label="🔕 감시 해제",
+            style=discord.ButtonStyle.danger,
+            row=3,
+        )
+        clear.callback = self._on_clear
+        self.add_item(clear)
+
+    # discord.py 는 item.callback(interaction) 만 넘긴다 → 값은 interaction.data 에서
+    @staticmethod
+    def _picked(interaction: discord.Interaction) -> int | None:
+        values = (interaction.data or {}).get("values") or []
+        return int(values[0]) if values else None
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        await interaction.response.edit_message(
+            embed=honeypot_embed(guild), view=HoneypotView(guild.id)
+        )
+
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        cid = self._picked(interaction)
+        if guild is None or cid is None:
+            return
+        ch = guild.get_channel(cid)
+        if not isinstance(ch, discord.TextChannel):
+            await _deny(interaction)
+            return
+        set_honeypot(guild.id, channel=ch.id)
+        await self._refresh(interaction)
+        await interaction.followup.send(
+            f"🍯 {ch.mention} 채널을 감시하기 시작했어요. "
+            "메시지를 보내면 **즉시 삭제 + 제재**됩니다.",
+            ephemeral=True,
+        )
+
+    async def _set_action(self, interaction: discord.Interaction, action: str) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        set_honeypot(guild.id, action=action)
+        await self._refresh(interaction)
+        await interaction.followup.send(
+            f"✅ 제재 방식을 **{HONEYPOT_ACTION_LABELS[action]}**(으)로 바꿨어요.",
+            ephemeral=True,
+        )
+
+    async def _on_kick(self, interaction: discord.Interaction) -> None:
+        await self._set_action(interaction, "kick")
+
+    async def _on_timeout(self, interaction: discord.Interaction) -> None:
+        await self._set_action(interaction, "timeout")
+
+    async def _on_ban(self, interaction: discord.Interaction) -> None:
+        await self._set_action(interaction, "ban")
+
+    async def _on_duration(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        picked = self._picked(interaction)
+        if guild is None or picked is None:
+            return
+        set_honeypot(guild.id, minutes=picked)
+        await self._refresh(interaction)
+        await interaction.followup.send(
+            f"⏱ 타임아웃 기간을 **{fmt_minutes(picked)}**로 맞췄어요.", ephemeral=True
+        )
+
+    async def _on_clear(self, interaction: discord.Interaction) -> None:
+        if not _verify_admin_ok(interaction):
+            await _deny(interaction)
+            return
+        guild = interaction.guild
+        if guild is None:
+            return
+        set_honeypot(guild.id, channel=None)
+        await self._refresh(interaction)
+        await interaction.followup.send("🔕 허니팟 감시를 껐어요.", ephemeral=True)
+
+
+bot.add_view(HoneypotView())
+
+
+@tree.command(
+    name="허니팟",
+    description="허니팟 채널 설정 — 지정 채널에 메시지 보내면 자동 제재 (관리자, 본인 화면에만 뜹니다)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def honeypot_panel(interaction: discord.Interaction):
+    guild = interaction.guild
+    assert guild is not None
+    await interaction.response.send_message(
+        embed=honeypot_embed(guild), view=HoneypotView(guild.id), ephemeral=True
     )
 
 
