@@ -16,7 +16,7 @@ services:
       - key: WEB_PUBLIC_URL
         sync: false
       - key: OAUTH_FORWARD
-        value: https://0uqekbvcof.apps.bot-hosting.cloud
+        value: https://verify-bot-vrd2.wispbyte.app
       - key: WEB_SECRET
         generateValue: true
       - key: VERIFIED_ROLE_NAME
