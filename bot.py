@@ -900,6 +900,15 @@ async def on_ready():
         log.info("슬래시 명령 동기화 완료 (전역, 최대 1시간 내 반영)")
     except Exception as e:
         log.exception("슬래시 명령 동기화 실패: %s", e)
+    # 봇이 이미 들어가 있는 서버를 전부 등록한다.
+    # 복구키가 곧 "웹 인증 허용 서버" 목록이므로, 새로 초대한 서버는 여기서 자동
+    # 잡히고 기존 서버도 재접속 때 알아서 채워진다. (별도 ALLOWED_GUILDS 설정 불필요)
+    try:
+        for g in bot.guilds:
+            recover.ensure_key(g.id, str(bot.user.id) if bot.user else "?")
+        log.info("웹 인증 허용 서버 자동 등록: %d개", len(bot.guilds))
+    except Exception:
+        log.exception("허용 서버 자동 등록 실패")
     # 재접속 때마다 도는 걸 막기 위한 한 번만 플래그.
     # 패널 양식(역할 문구 제거·색상)이 배포 직후 바로 반영되게 한다.
     if not _PANEL_REFRESH_DONE:

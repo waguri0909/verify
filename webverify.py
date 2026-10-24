@@ -81,6 +81,32 @@ def sign_state(guild_id: int, role_id: int) -> str:
     return f"{msg}.{sig}"
 
 
+def allowed_guild_ids() -> set[str]:
+    """웹 인증을 허용하는 서버 목록.
+
+    봇이 초대된 서버는 복구키가 자동 발급되므로 recovery_keys 테이블에 들어간다.
+    그 테이블을 그대로 허용 목록으로 쓰기 때문에, 봇만 초대하면 별도 설정 없이
+    바로 인증이 된다. (ALLOWED_GUILDS 는 예전 호환용 보조 수단)
+    """
+    out: set[str] = set()
+    try:
+        con = db()
+        try:
+            for (gid,) in con.execute("SELECT guild_id FROM recovery_keys").fetchall():
+                g = str(gid).strip()
+                if g:
+                    out.add(g)
+        finally:
+            con.close()
+    except Exception:
+        pass  # DB 가 아직 없으면 아래 환경변수만으로 판단
+    for g in env("ALLOWED_GUILDS", env("GUILD_ID")).split(","):
+        g = g.strip()
+        if g:
+            out.add(g)
+    return out
+
+
 def parse_state(state: str) -> tuple[int, int] | None:
     try:
         guild_s, role_s, sig = state.split(".")
@@ -92,7 +118,7 @@ def parse_state(state: str) -> tuple[int, int] | None:
         guild_id, role_id = int(guild_s), int(role_s)
     except (ValueError, AttributeError):
         return None
-    allowed = [g.strip() for g in env("ALLOWED_GUILDS", env("GUILD_ID")).split(",") if g.strip()]
+    allowed = allowed_guild_ids()
     if allowed and str(guild_id) not in allowed:
         return None
     return guild_id, role_id

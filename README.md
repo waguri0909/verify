@@ -234,12 +234,12 @@ Render 슬립 때문에 봇 명령어가 자주 죽는다면:
 | WEB_PUBLIC_URL | 사이트 공개 주소, 끝 `/` 없음 (웹인증 필수) |
 | WEB_SECRET | state 서명용 랜덤 문자열 (웹인증 필수) |
 | WEB_PORT | 웹 포트 (기본 8000, Render는 PORT 자동) |
-| ALLOWED_GUILDS | 웹인증 허용 서버ID (쉼표 구분, 비우면 GUILD_ID). 슬래시명령과는 무관 (전역 동기화) |
+| ALLOWED_GUILDS | (선택) 웹인증 허용 서버ID 추가 지정. **봇이 초대만 하면 자동 허용되므로 보통 비워둬도 됨** |
 | VERIFIED_ROLE_NAME | 기본 인증 롤 (서버 단위 지정이 없을 때). 값이 **서버 실제 역할 이름과 완전히 일치**해야 함 |
 | UNVERIFIED_ROLE_NAME | 입장시 부여 미인증 롤. 이름이 다르면 패널에 미지정으로 나옴 |
 | AUTH_CHANNEL_ID / LOG_CHANNEL_ID | 환영멘션 / 입장로그 채널 (선택) |
 | MIN_ACCOUNT_AGE_DAYS | 최근생성계정 경고 기준일 (기본 7) |
-| GUILD_ID | ALLOWED_GUILDS가 없을 때의 웹인증 기본 허용 서버 |
+| GUILD_ID | (선택) ALLOWED_GUILDS가 비어있을 때의 기본 허용 서버. 역시 자동 등록이 되므로 보통 불필요 |
 
 ## 7. 트러블슈팅
 - "서버에 입장하지 않았습니다" → 유저가 서버에 먼저 들어와 있어야 역할 지급 가능
