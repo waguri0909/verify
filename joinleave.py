@@ -126,14 +126,135 @@ def summary(guild_id: int, kind: str) -> str:
 
 
 # ---------- 폰트 / 헬퍼 ----------
+# 폰트 탐색 순서:
+#   1) assets/fonts/Pretendard (프로젝트 동봉 — 한글 지원)
+#   2) OS 기본 폰트 (Windows 맑은고딕 / macOS苹方 등 — 한글 지원)
+#   3) Linux 컨테이너의 한글 지원 폰트 자동 스캔 (Noto CJK, Nanum, UnDotum …)
+#   4) 최종 폴백 = PIL 기본 폰트 (한글 글자 없음 → □□ 로 보임)
+# 컨테이너에 폰트가 빠져도 3번에서 살아나도록 후보를 넓게 잡는다.
+_FONT_CANDIDATES = {
+    True: (
+        "Pretendard-Bold.otf",
+        "Pretendard-SemiBold.otf",
+    ),
+    False: (
+        "Pretendard-Regular.otf",
+        "Pretendard-Medium.otf",
+    ),
+}
+# (경로, 후보파일명) — OS 가 설치해 둔 한글 지원 폰트
+_SYS_FONT_DIRS = (
+    # Windows
+    r"C:\Windows\Fonts",
+    # macOS
+    "/System/Library/Fonts",
+    "/Library/Fonts",
+    str(Path.home() / "Library" / "Fonts"),
+    # Linux (Docker / Pterodactyl 컨테이너)
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    str(Path.home() / ".fonts"),
+    str(Path.home() / ".local" / "share" / "fonts"),
+)
+# 한글을 지원할 법한 파일명 키워드 (대소문자 무시, 소문자 비교)
+_CJK_HINTS = (
+    "pretendard", "noto", "cjk", "nanum", "malgun", "gulim", "dotum",
+    "batang", "gothic", "myeongjo", "apple", "sourcehans", "hyqin",
+    "wqy", "droid", "unfonts", "un-gothic", "undotum",
+)
+_font_tried = False
+
+# assets/fonts 가 비어 있으면 (zip 해제 실패 등) Pretendard 를 받아와서 자기 스스로 복구한다.
+# 1회만 시도하고, 실패해도 배너가 죽지는 않는다(기본 폰트로 계속 그린다).
+_FONT_DOWNLOAD_URLS = {
+    True: "https://raw.githubusercontent.com/orioncactus/pretendard/main/packages/pretendard/dist/public/static/Pretendard-Bold.otf",
+    False: "https://raw.githubusercontent.com/orioncactus/pretendard/main/packages/pretendard/dist/public/static/Pretendard-Regular.otf",
+}
+_font_dl_done = False
+
+
+def _ensure_fonts() -> None:
+    """assets/fonts 에 Pretendard 가 없으면 내려받는다. 1회만 시도."""
+    global _font_dl_done
+    if _font_dl_done:
+        return
+    _font_dl_done = True  # 실패 재시도 방지(프로세스 생존 중엔 한 번만)
+    for bold, url in _FONT_DOWNLOAD_URLS.items():
+        name = _FONT_CANDIDATES[bold][0]
+        dest = FONT_DIR / name
+        if dest.exists() and dest.stat().st_size > 100_000:
+            continue
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            if len(data) < 100_000:
+                raise OSError("내려받은 폰트가 너무 작음 (%d bytes)" % len(data))
+            FONT_DIR.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            log.info("배너 폰트 자동 설치: %s (%d bytes)", dest, len(data))
+        except Exception as e:  # 네트워크 없어도 배너는 기본 폰트로 계속 그린다
+            log.warning("배너 폰트 자동 설치 실패 (%s): %s", name, e)
+
+
+def _scan_system_fonts() -> list[Path]:
+    """OS 폰트 폴더에서 한글 지원 폰트 파일을 찾아 목록으로 반환 (실패해도 빈 목록)."""
+    found: list[Path] = []
+    for d in _SYS_FONT_DIRS:
+        root = Path(d)
+        if not root.is_dir():
+            continue
+        try:
+            for f in root.rglob("*"):
+                if f.suffix.lower() not in (".ttf", ".otf", ".ttc"):
+                    continue
+                if any(h in f.name.lower() for h in _CJK_HINTS):
+                    found.append(f)
+        except OSError:
+            continue
+    return found
+
+
+def _font_paths(bold: bool) -> list[Path]:
+    """사용할 폰트 파일 후보 목록 (앞쪽부터 시도)."""
+    if not _font_tried:
+        _ensure_fonts()  # assets/fonts 가 비어 있으면 첫 호출 때 알아서 채운다
+    paths: list[Path] = [FONT_DIR / n for n in _FONT_CANDIDATES[bold]]
+    paths += [Path(d) / n for d in _SYS_FONT_DIRS for n in _FONT_CANDIDATES[bold]]
+    paths += _scan_system_fonts()
+    # 중복 제거 (존재하지 않는 경로도 그대로 둔다 — 시도해봐야 알 수 있음)
+    seen, out = set(), []
+    for p in paths:
+        if str(p) not in seen:
+            seen.add(str(p))
+            out.append(p)
+    return out
+
+
 def _font(size: int, bold: bool = True):
+    global _font_tried
     key = (size, bold)
     f = _FONT_CACHE.get(key)
     if f is None:
-        path = FONT_DIR / ("Pretendard-Bold.otf" if bold else "Pretendard-Regular.otf")
-        try:
-            f = ImageFont.truetype(str(path), size)
-        except Exception:
+        for path in _font_paths(bold):
+            try:
+                f = ImageFont.truetype(str(path), size)
+                if not _font_tried:
+                    log.info("배너 폰트 사용: %s", path)
+                    _font_tried = True
+                break
+            except Exception:
+                continue
+        if f is None:
+            # 한 글자도 못 찾음 → PIL 기본 폰트 (한글은 □ 로 나온다)
+            if not _font_tried:
+                log.warning(
+                    "배너 폰트를 찾지 못했습니다 (assets/fonts + OS 폰트 전부 실패). "
+                    "한글이 □ 로 나옵니다. assets/fonts/Pretendard-*.otf 파일을 확인하세요."
+                )
+                _font_tried = True
             f = _fallback_font(size)
         _FONT_CACHE[key] = f
     return f
