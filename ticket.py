@@ -727,6 +727,7 @@ def build_ticket_embed(rec: dict, status: str, closed_by: int | None = None,
 
 # ---------- 권한 ----------
 def is_staff(interaction: discord.Interaction) -> bool:
+    """티켓 관리 권한 — 설정된 관리자(스태프) 역할 또는 관리 권한 보유자."""
     user = interaction.user
     guild = interaction.guild
     if not isinstance(user, discord.Member) or guild is None:
@@ -735,14 +736,15 @@ def is_staff(interaction: discord.Interaction) -> bool:
     if sid and user.get_role(int(sid)) is not None:
         return True
     p = user.guild_permissions
-    return bool(p.administrator or p.manage_channels or p.manage_guild)
+    return bool(p.administrator or p.manage_guild)
 
 
 def can_manage(interaction: discord.Interaction, rec: dict) -> bool:
-    """티켓 닫기/삭제/재오픈 — 문의자 본인 또는 스태프."""
-    user = interaction.user
-    if isinstance(user, discord.Member) and user.id == _as_int(rec.get("owner")):
-        return True
+    """티켓 닫기/삭제/재오픈 — **관리자만**.
+
+    문의자 본인도 막는다. (신청자가 스스로 티켓을 정리해 버리면 기록이 사라짐)
+    관리자 판정은 티켓 관리 패널(⚙️)과 같은 기준 — 관리자 역할 또는 관리 권한.
+    """
     return is_staff(interaction)
 
 
@@ -1001,7 +1003,7 @@ async def close_ticket(interaction: discord.Interaction, note: str | None = None
         return
     if not can_manage(interaction, rec):
         await interaction.response.send_message(
-            "❌ 티켓을 닫으려면 스태프 권한이 필요해요.", ephemeral=True
+            "❌ 티켓을 닫으려면 **관리자** 권한이 필요해요.", ephemeral=True
         )
         return
 
@@ -1050,7 +1052,7 @@ async def reopen_ticket(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("❌ 닫혀 있는 티켓만 재오픈할 수 있어요.", ephemeral=True)
         return
     if not can_manage(interaction, rec):
-        await interaction.response.send_message("❌ 재오픈은 스태프 권한이 필요해요.", ephemeral=True)
+        await interaction.response.send_message("❌ 재오픈은 **관리자** 권한이 필요해요.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1093,7 +1095,7 @@ async def delete_ticket(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("❌ 티켓 기록이 없는 채널이에요.", ephemeral=True)
         return
     if not can_manage(interaction, rec):
-        await interaction.response.send_message("❌ 삭제는 스태프 권한이 필요해요.", ephemeral=True)
+        await interaction.response.send_message("❌ 삭제는 **관리자** 권한이 필요해요.", ephemeral=True)
         return
 
     label = number_label(int(rec.get("number", 0)))

@@ -1,7 +1,8 @@
-"""웹 OAuth 인증 (이메일 + 중복IP 검사) + Discord REST 역할 지급.
+"""웹 OAuth 인증 (이메일 검사) + Discord REST 역할 지급.
 
 흐름: 패널 링크 → Discord OAuth 승인(identify+email) → /callback →
-  토큰 교환 → 유저조회 → 이메일인증여부/중복IP 검사 → 역할 지급 → 결과 페이지.
+  토큰 교환 → 유저조회 → 이메일인증여부 검사 → 역할 지급 → 결과 페이지.
+  (중복IP 검사는 제거 — 서버 간/공용 IP에서도 모두 인증 가능)
 봇 토큰으로 REST 호출하므로 봇 상시접속 없이도 역할 지급 가능.
 인증 기록은 verifications.db(SQLite)에 저장.
 """
@@ -1010,26 +1011,9 @@ async def callback(request: web.Request) -> web.Response:
                 False,
             )
 
-        dup = ip_used_by_other(guild_id, ip, user_id)
-        if dup:
-            await notify_webhook(
-                {
-                    "title": "❌ 인증 실패 (중복 IP)",
-                    "color": 0xED4245,
-                    "fields": [
-                        {"name": "유저", "value": f"{username} (`{user_id}`)", "inline": False},
-                        {"name": "이메일", "value": f"`{email or '-'}`", "inline": True},
-                        {"name": "IP", "value": f"{ip} (기존 `{dup}`와 동일)", "inline": False},
-                    ],
-                },
-                guild_id,
-            )
-            return page(
-                "인증 실패",
-                "이 접속 기록으로는 이미 다른 계정이 인증됐습니다.<br>"
-                "본인 계정으로 문의해주세요.",
-                False,
-            )
+        # 중복 IP 검사는 봤다. (같은 서버여도 공용 IP/가족/학교 때문에 막히는 일이 많아서
+        # 차단 대상에서 제외. 동일 서버 다중 계정도 이제 인증 가능)
+        # 필요하면 관리자가 DB(verifications)를 직접 확인하면 된다.
 
         ok, reason = await add_role(s, guild_id, user_id, role_id)
         if not ok:
