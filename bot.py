@@ -2858,7 +2858,62 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
         pass
 
 
+def _restore_seed() -> None:
+    """호스팅 이전 때 상태 파일이 **하나라도 없으면** 그 파일만 채운다.
+
+    Render 같은 곳은 git 배포만 되는데 `panels.json`·`roles.json`·`tickets.json`·
+    `verifications.db` 는 git 대상이 아니다(공개 저장소라 절대 올리면 안 된다).
+    그래서 이 파일들을 `SEED_B64` (tar.gz → base64) 환경변수로 들고 와서 채운다.
+
+    ⚠️ 핵심 규칙: **이미 있는 파일은 절대 덮어쓰지 않는다.**
+    Render 무료는 배포할 때 디스크를 초기화하니 그때만 시드로 되살아나고,
+    평소 재시작·슬립 해제 때는 살아있는 인증 기록·티켓 기록을 건드린다.
+    (이전에 마커 파일로 "한 번만" 판정했더니 배포 후 디스크 초기화로 마커까지
+     날아가 재시작마다 덮어쓸 뻔했어서 파일 존재 판정으로 바꿈)
+    """
+    seed = os.getenv("SEED_B64", "").strip()
+    if not seed:
+        return
+    import base64
+    import io
+    import tarfile
+
+    try:
+        blob = base64.b64decode(seed)
+        root = BASE_DIR.resolve()
+        written, skipped = [], []
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                dest = (root / m.name).resolve()
+                # 디렉토리 밖으로 새는 경로(절대경로·..) 차단
+                if dest != root and root not in dest.parents:
+                    log.warning("SEED 위험한 경로 차단: %s", m.name)
+                    continue
+                if dest.exists():
+                    skipped.append(m.name)
+                    continue
+                src = tf.extractfile(m)
+                if src is None:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(src.read())
+                written.append(m.name)
+        if written:
+            log.info(
+                "SEED 복원: %s%s",
+                ", ".join(written),
+                f" (보존됨: {', '.join(skipped)})" if skipped else "",
+            )
+        elif skipped:
+            log.info("SEED 생략 — 상태 파일이 이미 모두 있음 (%s)", ", ".join(skipped))
+    except Exception as exc:  # noqa: BLE001 — 씨앗 실패로 봇 전체가 안 뜨면 안 된다
+        log.error("SEED 복원 실패 (그래도 계속 실행): %s", exc)
+
+
 async def main():
+    _restore_seed()
     errs = config.validate()
     if errs:
         print("❌ " + "\n".join(errs))

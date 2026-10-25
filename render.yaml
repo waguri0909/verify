@@ -15,8 +15,21 @@ services:
         sync: false
       - key: WEB_PUBLIC_URL
         sync: false
+      # Render 통합: 봇+웹+DB가 한 서비스에서 돈다.
+      # → 콜백을 외부로 넘기지 않고 자기 자신이 처리하므로 비워둔다.
+      # (디스코드 리다이렉트 주소 https://discord-verify-vrd2.onrender.com/callback 는 불변)
       - key: OAUTH_FORWARD
-        value: https://verify-bot-vrd2.wispbyte.app
+        value: ""
+      # 봇 끄기 스위치 — 값이 비어야 봇+웹이 함께 뜬다
+      - key: DISABLE_BOT
+        value: ""
+      # git에 없는 상태 파일(panels/roles/tickets/verifications.db)을
+      # 배포 후 디스크 초기화 때 되살리는 씨앗. 있으면 절대 덮어쓰지 않는다.
+      - key: SEED_B64
+        sync: false
+      # bot↔web 이 같은 프로세스면 로컬 포트로 직접 붙는다(webapi._base 가 PORT 판별)
+      - key: WEB_API_URL
+        sync: false
       - key: WEB_SECRET
         generateValue: true
       - key: VERIFIED_ROLE_NAME

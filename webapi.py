@@ -5,6 +5,8 @@
 인증: X-Api-Key 헤더 = WEB_SECRET. 베이스 = WEB_API_URL (없으면 WEB_PUBLIC_URL).
 """
 
+import os
+
 import aiohttp
 
 from webverify import env
@@ -19,7 +21,20 @@ class ApiError(Exception):
 def _base() -> str:
     # 봇과 웹이 같은 서버에 있으면 WEB_API_URL 로 로컬 주소를 쓴다.
     # WEB_PUBLIC_URL 은 디스코드 리다이렉트 주소용이라 그대로 둔다(둘 다 있을 때).
-    return (env("WEB_API_URL") or env("WEB_PUBLIC_URL")).rstrip("/")
+    explicit = env("WEB_API_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    # WEB_API_URL 이 비면 자기 포트로 직접 붙는다.
+    # Render 통합처럼 봇+웹이 한 프로세스인 경우 쓴다 — PORT 는 런타임에
+    # 배정되므로 미리 환경변수에 못 적는다. 외부 URL로 한 바퀴 돌 필요도 없다.
+    port = (
+        os.getenv("PORT", "").strip()
+        or os.getenv("WEB_PORT", "").strip()
+        or os.getenv("SERVER_PORT", "").strip()
+    )
+    if port:
+        return f"http://127.0.0.1:{port}"
+    return env("WEB_PUBLIC_URL").rstrip("/")
 
 
 async def _req(method: str, path: str, **kw) -> dict:
