@@ -2945,3 +2945,17 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         # 패널의 Stop/재시작이 보내는 중지 신호. 스택트레이스 대신 한 줄로 정리.
         print("\n⏹ 중지 신호를 받아 종료했습니다.", flush=True)
+    except BaseException as exc:  # noqa: BLE001 — 호스팅 로그에 "왜 죽었는지" 마지막 줄로 남긴다
+        # Render 로그 뷰어는 마지막 N줄만 보여주고, 예외 메시지가 긴 HTML이면
+        # 트레이스백 헤더가 잘려나간다. 그래서 요약 한 줄을 가장 마지막에 찍는다.
+        print(traceback.format_exc(), flush=True)
+        status = getattr(exc, "status", None) or getattr(
+            getattr(exc, "response", None), "status", None
+        )
+        url = getattr(exc, "url", None) or getattr(getattr(exc, "response", None), "url", None)
+        head = str(exc).replace("\n", " ").replace("\r", " ")[:160]
+        print(
+            f"❌ FATAL-LAST: {type(exc).__name__} status={status} url={url} :: {head}",
+            flush=True,
+        )
+        raise SystemExit(1)
