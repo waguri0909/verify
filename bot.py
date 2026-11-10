@@ -3015,11 +3015,11 @@ async def main():
         # 죽으면 라이브 로그를 아예 못 보여줘서 트레이스백을 읽을 수 없다.
         # 살아있는 동안 /lasterror 로 원인을 읽으며 재시도한다.
         #
-        # ⚠️ 재시도 간격이 중요하다: Discord가 Cloudflare로 429(IP rate limit,
-        # error code 1015)를 때리면 짧은 간격 재시도가 그 창을 계속 갱신해서
-        # 영원히 풀리지 않는다. 그래서 rate limit류는 30분 고정(우리 요청을
-        # 거의 0에 가깝게 해 놓아야 차단 창이 빠진다),
-        # 그 밖에는 2분→4분→…→15분으로 지수 백오프한다.
+        # ⚠️ 재시도 간격이 중요하다: Discord는 클라우드 IP에 공격적으로 rate limit을
+        # 거는데(Cloudflare 1015 — Discord가 Cloudflare 뒤에서 IP 차단), 짧은 간격
+        # 재시도는 그 차단 창을 계속 갱신해서 영원히 안 풀린다.
+        # Cloudflare 공식: "짧은 시간에 반복 시도하면 차단이 연장될 수 있다."
+        # 그래서 rate limit류는 1시간에 한 번만, 그 밖에는 2분→4분→…→15분 백오프.
         delay = 120
         while True:
             try:
@@ -3038,7 +3038,7 @@ async def main():
                     k in STARTUP_ERROR
                     for k in ("429", "Too Many Requests", "rate limit")
                 )
-                wait = 1800 if rate_limited else delay
+                wait = 3600 if rate_limited else delay
                 log.error("봇 시작 실패 (%d초 후 재시도): %s", wait, STARTUP_ERROR[:400])
                 print("❌ FATAL-LAST: " + STARTUP_ERROR, flush=True)
                 await asyncio.sleep(wait)
