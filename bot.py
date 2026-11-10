@@ -2965,16 +2965,28 @@ async def main():
     if do_bot:
         # 봇 시작이 실패해도 웹(/health)은 살려둔다. Render 무료 플랜은 인스턴스가
         # 죽으면 라이브 로그를 아예 못 보여줘서 트레이스백을 읽을 수 없다.
-        # 살아있는 동안 /lasterror 로 원인을 읽고, 60초마다 재시도한다.
+        # 살아있는 동안 /lasterror 로 원인을 읽으며 재시도한다.
+        #
+        # ⚠️ 재시도 간격이 중요하다: Discord가 Cloudflare로 429(IP rate limit,
+        # error code 1015)를 때리면 짧은 간격 재시도가 그 창을 계속 갱신해서
+        # 영원히 풀리지 않는다. 그래서 rate limit류는 10분 고정,
+        # 그 밖에는 2분→4분→…→15분으로 지수 백오프한다.
+        delay = 120
         while True:
             try:
                 await bot.start(config.token)
                 break
             except Exception as exc:  # noqa: BLE001
                 STARTUP_ERROR = f"{type(exc).__name__}: {exc}"[:1500]
-                log.error("봇 시작 실패 (60초 후 재시도): %s", STARTUP_ERROR[:400])
+                rate_limited = any(
+                    k in STARTUP_ERROR
+                    for k in ("429", "Too Many Requests", "rate limit")
+                )
+                wait = 600 if rate_limited else delay
+                log.error("봇 시작 실패 (%d초 후 재시도): %s", wait, STARTUP_ERROR[:400])
                 print("❌ FATAL-LAST: " + STARTUP_ERROR, flush=True)
-                await asyncio.sleep(60)
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 900)
     else:
         log.info("봇 비활성 모드 (웹만 실행)")
         webverify.bot_status_fn = lambda: {"bot": "web-only", "guilds": 0}
