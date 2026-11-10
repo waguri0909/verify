@@ -2858,6 +2858,27 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
         pass
 
 
+# 시작 실패 원인을 밖에서 읽을 수 있게 남긴다 (Render 로그 뷰어가 마지막 줄만
+# 보여주는 탓에 트레이스백이 잘려나가서). /lasterror?key=WEB_SECRET 로 확인.
+STARTUP_ERROR = ""
+SEED_STATUS = "not run"
+
+
+def _lasterror(request: web.Request) -> web.Response:
+    """봇 시작 실패 원인·시드 복원 결과를 알려주는 진단용 엔드포인트."""
+    key = (request.query.get("key") or "").strip().strip('"').strip("'")
+    expect = os.getenv("WEB_SECRET", "").strip().strip('"').strip("'")
+    if not expect or key != expect:
+        return web.Response(status=401, text="unauthorized")
+    return web.json_response(
+        {
+            "error": STARTUP_ERROR,
+            "seed": SEED_STATUS,
+            "bot": _bot_status(),
+        }
+    )
+
+
 def _restore_seed() -> None:
     """호스팅 이전 때 상태 파일이 **하나라도 없으면** 그 파일만 채운다.
 
@@ -2871,8 +2892,10 @@ def _restore_seed() -> None:
     (이전에 마커 파일로 "한 번만" 판정했더니 배포 후 디스크 초기화로 마커까지
      날아가 재시작마다 덮어쓸 뻔했어서 파일 존재 판정으로 바꿈)
     """
+    global SEED_STATUS
     seed = os.getenv("SEED_B64", "").strip()
     if not seed:
+        SEED_STATUS = "no SEED_B64"
         return
     import base64
     import io
@@ -2901,18 +2924,24 @@ def _restore_seed() -> None:
                 dest.write_bytes(src.read())
                 written.append(m.name)
         if written:
+            SEED_STATUS = "복원: " + ", ".join(written) + (
+                f" (보존: {', '.join(skipped)})" if skipped else ""
+            )
             log.info(
                 "SEED 복원: %s%s",
                 ", ".join(written),
                 f" (보존됨: {', '.join(skipped)})" if skipped else "",
             )
         elif skipped:
+            SEED_STATUS = "생략(이미 모두 있음): " + ", ".join(skipped)
             log.info("SEED 생략 — 상태 파일이 이미 모두 있음 (%s)", ", ".join(skipped))
     except Exception as exc:  # noqa: BLE001 — 씨앗 실패로 봇 전체가 안 뜨면 안 된다
+        SEED_STATUS = f"실패: {type(exc).__name__}: {exc}"
         log.error("SEED 복원 실패 (그래도 계속 실행): %s", exc)
 
 
 async def main():
+    global STARTUP_ERROR
     _restore_seed()
     errs = config.validate()
     if errs:
@@ -2927,12 +2956,25 @@ async def main():
     if do_web:
         for e in webverify.validate():
             log.warning("웹 인증 미설정: %s", e)
-        runner = web.AppRunner(webverify.create_app())
+        app = webverify.create_app()
+        app.router.add_get("/lasterror", _lasterror)
+        runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", config.web_port).start()
         log.info("웹 실행: 포트 %s (/health)", config.web_port)
     if do_bot:
-        await bot.start(config.token)
+        # 봇 시작이 실패해도 웹(/health)은 살려둔다. Render 무료 플랜은 인스턴스가
+        # 죽으면 라이브 로그를 아예 못 보여줘서 트레이스백을 읽을 수 없다.
+        # 살아있는 동안 /lasterror 로 원인을 읽고, 60초마다 재시도한다.
+        while True:
+            try:
+                await bot.start(config.token)
+                break
+            except Exception as exc:  # noqa: BLE001
+                STARTUP_ERROR = f"{type(exc).__name__}: {exc}"[:1500]
+                log.error("봇 시작 실패 (60초 후 재시도): %s", STARTUP_ERROR[:400])
+                print("❌ FATAL-LAST: " + STARTUP_ERROR, flush=True)
+                await asyncio.sleep(60)
     else:
         log.info("봇 비활성 모드 (웹만 실행)")
         webverify.bot_status_fn = lambda: {"bot": "web-only", "guilds": 0}
