@@ -2864,46 +2864,67 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
 STARTUP_ERROR = ""
 SEED_STATUS = "not run"
 
-# Discord IP 차단 진단용 프로브 결과 (5분 캐시).
+# Discord IP 차단 진단용 프로브 결과 (10분 캐시, 기본 호출 시엔 안 돈다 —
+# /lasterror?...&probe=1 일 때만 실행해서 차단 창을 갱신하지 않으려고).
 # - 인증 없는 GET /gateway 가 통과 → 로그인 엔드포인트만 제한 (기다리면 풀림)
 # - 그쪽도 Cloudflare HTML 429 → IP 전체가 엣지에서 차단됨 (오래 걸릴 수 있음)
+# - egress=… 로 아웃바운드 IP를 함께 찍어서 재배포 때 IP가 바뀌는지 본다
 _PROBE_AT = 0.0
 _PROBE_VAL = "not probed"
 
 
 async def _discord_probe() -> str:
-    """Render 서버에서 Discord로 얕은 요청 하나를 보내 IP 차단 범위를 확인한다."""
+    """Render 서버의 아웃바운드 IP와 Discord 엣지 차단 여부를 확인한다."""
     global _PROBE_AT, _PROBE_VAL
     now = time.time()
-    if _PROBE_VAL != "not probed" and now - _PROBE_AT < 300:
+    if _PROBE_VAL != "not probed" and now - _PROBE_AT < 600:
         return _PROBE_VAL
     _PROBE_AT = now
+    out: list[str] = []
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; healthprobe)"}
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; healthprobe)"}
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
-            async with s.get("https://discord.com/api/v10/gateway") as r:
-                body = (await r.text())[:120].replace("\n", " ")
-                _PROBE_VAL = f"HTTP {r.status} :: {body}"
+            # 1) 우리 아웃바운드 IP (재배포·재시작 때 바뀌는지 확인용)
+            try:
+                async with s.get("https://www.cloudflare.com/cdn-cgi/trace") as r:
+                    txt = await r.text()
+                    ip = "?"
+                    for line in txt.splitlines():
+                        if line.startswith("ip="):
+                            ip = line.split("=", 1)[1]
+                            break
+                    out.append("egress=" + ip)
+            except Exception as exc:  # noqa: BLE001
+                out.append("egress=ERR " + type(exc).__name__)
+            # 2) Discord 엣지 차단 여부 (인증 없는 얕은 요청)
+            try:
+                async with s.get("https://discord.com/api/v10/gateway") as r:
+                    body = (await r.text())[:80].replace("\n", " ")
+                    out.append(f"discord=HTTP {r.status} :: {body}")
+            except Exception as exc:  # noqa: BLE001
+                out.append("discord=ERR " + type(exc).__name__)
     except Exception as exc:  # noqa: BLE001
-        _PROBE_VAL = f"ERR {type(exc).__name__}: {exc}"[:200]
+        out.append("ERR " + type(exc).__name__)
+    _PROBE_VAL = " | ".join(out)
     return _PROBE_VAL
 
 
 async def _lasterror(request: web.Request) -> web.Response:
-    """봇 시작 실패 원인·시드 복원 결과·IP 차단 범위를 알려주는 진단용 엔드포인트."""
+    """봇 시작 실패 원인·시드 복원 결과를 알려주는 진단용 엔드포인트."""
     key = (request.query.get("key") or "").strip().strip('"').strip("'")
     expect = os.getenv("WEB_SECRET", "").strip().strip('"').strip("'")
     if not expect or key != expect:
         return web.Response(status=401, text="unauthorized")
-    return web.json_response(
-        {
-            "error": STARTUP_ERROR,
-            "seed": SEED_STATUS,
-            "bot": _bot_status(),
-            "probe": await _discord_probe(),
-        }
-    )
+    payload = {
+        "error": STARTUP_ERROR,
+        "seed": SEED_STATUS,
+        "bot": _bot_status(),
+    }
+    # 프로브는 명시적으로 요청할 때만 (Discord 로그에 우리 요청을 남기지 않기 위해)
+    if (request.query.get("probe") or "") == "1":
+        payload["probe"] = await _discord_probe()
+    return web.json_response(payload)
 
 
 def _restore_seed() -> None:
