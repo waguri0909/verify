@@ -10,6 +10,7 @@
 등록: bot.py 가 views 를 `bot.add_view` 로 등록하고 슬래시명령을 붙입니다.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -342,6 +343,8 @@ async def discover_panels(guild: discord.Guild) -> int:
     for ch in guild.text_channels[:40]:
         if me is not None and not ch.permissions_for(me).read_message_history:
             continue
+        # 연속 조회가 디스코드 엣지 rate limit(429 HTML 차단)을 부르지 않게 느리게
+        await asyncio.sleep(0.4)
         try:
             messages = [m async for m in ch.history(limit=50)]
         except discord.HTTPException:
@@ -385,6 +388,8 @@ async def refresh_panels(guild: discord.Guild) -> tuple[int, int, int]:
         if rec.get("channel") != cid:
             rec["channel"] = cid  # 채널 위치 백필 → 다음엔 바로 찾는다
             changed = True
+        # 연속 PATCH 가 엣지 차단을 부르지 않게 한 템포 쉰다
+        await asyncio.sleep(0.8)
         try:
             await msg.edit(embed=_restyle(msg, color), view=view)
         except discord.HTTPException:

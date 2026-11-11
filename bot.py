@@ -427,6 +427,8 @@ async def discover_verify_panels(guild: discord.Guild) -> int:
     for ch in guild.text_channels[:_SCAN_CHANNELS]:
         if me is not None and not ch.permissions_for(me).read_message_history:
             continue
+        # 연속 조회가 디스코드 엣지 rate limit(429 HTML 차단)을 부르지 않게 느리게
+        await asyncio.sleep(0.4)
         try:
             messages = [m async for m in ch.history(limit=_SCAN_HISTORY)]
         except discord.HTTPException:
@@ -489,6 +491,8 @@ async def refresh_verify_panels(
         if e.get("channel") != msg.channel.id:
             e["channel"] = msg.channel.id  # 채널 기록 백필
             changed = True
+        # 연속 PATCH 가 엣지 차단을 부르지 않게 한 템포 쉰다 (발단이 여기였다)
+        await asyncio.sleep(0.8)
         ok += 1
     if changed:
         _save_json(PANEL_FILE, panels)
@@ -881,6 +885,8 @@ async def _refresh_all_panels() -> None:
                 await sync_trap_message(g)
             except Exception:
                 log.exception("허니팟 카운터 동기화 실패 guild=%s", g.id)
+        # 4) 서버와 서버 사이에도간격 — 시작 직후 한꺼번에 몰리면 엣지 차단을 부른다
+        await asyncio.sleep(1.5)
 
 
 @bot.event
@@ -2910,6 +2916,30 @@ async def _discord_probe() -> str:
     return _PROBE_VAL
 
 
+async def _wait_edge_clear(max_wait: int = 6 * 3600) -> None:
+    """Discord 엣지 차단이 풀릴 때까지 **10분에 한 번** 얕은 프로브만 한다.
+
+    이 대기 동안 로그인을 다시 시도하지 않는다 — 짧은 간격 재시도는 Cloudflare
+    차단 창을 계속 갱신해서 영원히 안 풀린다(Cloudflare 공식 문서).
+    프로브는 요청 1회/10분이라 차단에 영향을 주지 않고, 풀리는 순간 바로
+    복귀할 수 있게 해준다. (매시간 재시도하던 방식은 풀린 뒤에도最长 1시간을 기다렸다)
+    """
+    waited = 0
+    while waited < max_wait:
+        await asyncio.sleep(600)
+        waited += 600
+        try:
+            probe = await _discord_probe()
+        except Exception as exc:  # noqa: BLE001 — 프로브 실패도 대기로 처리
+            log.warning("엣지 프로브 실패 (%d분 경과): %s", waited // 60, exc)
+            continue
+        log.info("엣지 차단 확인 (%d분 경과): %s", waited // 60, probe)
+        if "discord=HTTP 200" in probe:
+            log.info("차단 해제 감지 — 로그인을 다시 시도한다")
+            return
+    log.warning("차단이 %d분 이상 지속 — 로그인을 직접 시도해 본다", max_wait // 60)
+
+
 async def _lasterror(request: web.Request) -> web.Response:
     """봇 시작 실패 원인·시드 복원 결과를 알려주는 진단용 엔드포인트."""
     key = (request.query.get("key") or "").strip().strip('"').strip("'")
@@ -3019,7 +3049,8 @@ async def main():
         # 거는데(Cloudflare 1015 — Discord가 Cloudflare 뒤에서 IP 차단), 짧은 간격
         # 재시도는 그 차단 창을 계속 갱신해서 영원히 안 풀린다.
         # Cloudflare 공식: "짧은 시간에 반복 시도하면 차단이 연장될 수 있다."
-        # 그래서 rate limit류는 1시간에 한 번만, 그 밖에는 2분→4분→…→15분 백오프.
+        # → rate limit(엣지 차단)은 _wait_edge_clear() 로 **10분에 한 번** 프로브만
+        #   하고, 풀리는 순간 바로 로그인한다. 그 밖에는 2분→4분→…→15분 백오프.
         delay = 120
         while True:
             try:
@@ -3038,10 +3069,21 @@ async def main():
                     k in STARTUP_ERROR
                     for k in ("429", "Too Many Requests", "rate limit")
                 )
-                wait = 3600 if rate_limited else delay
-                log.error("봇 시작 실패 (%d초 후 재시도): %s", wait, STARTUP_ERROR[:400])
+                if rate_limited:
+                    # 엣지 차단은 매시간 재시도하지 않는다. 풀리는 순간을 노려서
+                    # 바로 로그인 시도 — 재시도를 앞당기면 차단이 연장된다.
+                    await _wait_edge_clear()
+                    wait = 0
+                else:
+                    wait = delay
+                log.error(
+                    "봇 시작 실패 (%s): %s",
+                    "엣지 차단 — 해제 확인 후 즉시 재시도" if wait == 0 else f"{wait}초 후 재시도",
+                    STARTUP_ERROR[:400],
+                )
                 print("❌ FATAL-LAST: " + STARTUP_ERROR, flush=True)
-                await asyncio.sleep(wait)
+                if wait:
+                    await asyncio.sleep(wait)
                 delay = min(delay * 2, 900)
     else:
         log.info("봇 비활성 모드 (웹만 실행)")
