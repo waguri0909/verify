@@ -527,8 +527,8 @@ CSS = """
 body{margin:0;min-height:100vh;padding:24px;color:var(--txt);
  font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;
  background-color:#000000;
- background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='24'%20height='24'%3E%3Cpath%20d='M0%20.5H24M.5%200V24'%20fill='none'%20stroke='%23ffffff'%20stroke-opacity='.055'%20stroke-width='1'/%3E%3C/svg%3E");
- background-size:24px 24px;background-attachment:fixed;
+ background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='18'%20height='18'%3E%3Cpath%20d='M0%20.5H18M.5%200V18'%20fill='none'%20stroke='%23ffffff'%20stroke-opacity='.055'%20stroke-width='1'/%3E%3C/svg%3E");
+ background-size:18px 18px;background-attachment:fixed;
  -webkit-font-smoothing:antialiased;
  display:flex;align-items:center;justify-content:center}
 .stage{position:relative;z-index:1;width:100%;max-width:430px;
