@@ -1,0 +1,39 @@
+# Render 무료 플랜은 15분 동안 들어오는 HTTP 요청이 없으면 인스턴스를 꺼버린다
+# (봇도 함께 죽고 다음 요청까지 50초 이상 걸린다).
+# 그래서 GitHub 공개 저장소의 무료 Actions로 10분마다 /health 를 때려서
+# 인스턴스를 깨운다. UptimeRobot 계정 없이 PC 없이 24시간 돌린다.
+#
+# 참고: GitHub은 저장소 활동(커밋)이 60일 없으면 스케줄 워크플로를 자동 정지시킨다.
+# 간헐적으로 커밋만 해주면 계속 돈다.
+
+name: Keep Render awake
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET /health
+        run: |
+          URL="https://discord-verify-vrd2.onrender.com/health"
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/health_body.txt -w '%{http_code}' --max-time 100 "$URL" || true)
+            echo "[$i] HTTP ${code:-000}"
+            if [ "$code" = "200" ]; then
+              echo -n "body: "
+              cat /tmp/health_body.txt
+              echo
+              exit 0
+            fi
+            # 슬립 해제에는 최대 50초가 걸린다 -> 잠시 기다렸다 재시도
+            sleep 20
+          done
+          # 알림 스팸을 막기 위해 실패해도 항상 성공으로 종료한다.
+          # (실제로 다운이면 /lasterror 대시보드에서 확인하면 된다)
+          echo "health 응답 없음 - 그래도 종료 코드는 0 (스팸 방지)"
+          exit 0
