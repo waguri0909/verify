@@ -522,47 +522,36 @@ async def _deliver_webhook(embed: dict, guild_id: int | str | None = None) -> No
 # ---------- HTML ----------
 CSS = """
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css');
-:root{--txt:#eef0f8;--sub:#98a0bd;--line:rgba(255,255,255,.09);--card:rgba(17,20,36,.72)}
+:root{--txt:#ffffff;--sub:#868b98;--line:rgba(255,255,255,.13);--card:#0a0a0c}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;padding:24px;color:var(--txt);
  font-family:'Pretendard',-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;
- background:
-  radial-gradient(900px 520px at 10% -12%,rgba(88,101,242,.40),transparent 60%),
-  radial-gradient(780px 500px at 94% 6%,rgba(139,92,246,.30),transparent 62%),
-  radial-gradient(760px 760px at 50% 116%,rgba(56,189,248,.18),transparent 62%),
-  linear-gradient(165deg,#080a16 0%,#0b0e1a 48%,#070912 100%);
- background-attachment:fixed;-webkit-font-smoothing:antialiased;
+ background-color:#000000;
+ background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='44'%20height='44'%3E%3Cpath%20d='M0%20.5H44M.5%200V44'%20fill='none'%20stroke='%23ffffff'%20stroke-opacity='.05'%20stroke-width='1'/%3E%3Cpath%20d='M22%2016v12M16%2022h12'%20fill='none'%20stroke='%23ffffff'%20stroke-opacity='.11'%20stroke-width='1.3'%20stroke-linecap='round'/%3E%3C/svg%3E");
+ background-size:44px 44px;background-attachment:fixed;
+ -webkit-font-smoothing:antialiased;
  display:flex;align-items:center;justify-content:center}
-.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.42;pointer-events:none;z-index:0}
-.orb.a{width:420px;height:420px;left:-130px;top:-130px;background:#5865f2;
- animation:drift 17s ease-in-out infinite}
-.orb.b{width:400px;height:400px;right:-120px;bottom:-140px;background:#8b5cf6;
- animation:drift 21s ease-in-out infinite reverse}
-@keyframes drift{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(46px,-34px,0)}}
 .stage{position:relative;z-index:1;width:100%;max-width:430px;
  animation:rise .55s cubic-bezier(.2,.8,.2,1) both}
 @keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
-.card{position:relative;overflow:hidden;border-radius:26px;padding:40px 34px 30px;
+.card{position:relative;overflow:hidden;border-radius:22px;padding:40px 34px 30px;
  text-align:center;
- background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.02)),var(--card);
- backdrop-filter:blur(20px) saturate(150%);
- -webkit-backdrop-filter:blur(20px) saturate(150%);
+ background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,0)),var(--card);
  border:1px solid var(--line);
- box-shadow:0 34px 90px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.09)}
+ box-shadow:0 30px 80px rgba(0,0,0,.75),inset 0 1px 0 rgba(255,255,255,.07)}
 .card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
- background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent)}
+ background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent)}
 .card::after{content:'';position:absolute;top:-150px;left:50%;width:280px;height:280px;
- transform:translateX(-50%);border-radius:50%;filter:blur(14px);opacity:.34;pointer-events:none;
- background:radial-gradient(circle,#5865f2,transparent 70%)}
-.card.ok::after{background:radial-gradient(circle,#3ba55d,transparent 70%)}
-.card.no::after{background:radial-gradient(circle,#ed4245,transparent 70%)}
+ transform:translateX(-50%);border-radius:50%;filter:blur(16px);opacity:.18;pointer-events:none;
+ background:radial-gradient(circle,rgba(255,255,255,.6),transparent 70%)}
+.card.ok::after{background:radial-gradient(circle,rgba(87,242,135,.6),transparent 70%);opacity:.26}
+.card.no::after{background:radial-gradient(circle,rgba(237,66,69,.6),transparent 70%);opacity:.26}
 .badge{position:relative;z-index:1;width:86px;height:86px;margin:0 auto 18px;border-radius:50%;
  display:flex;align-items:center;justify-content:center;font-size:38px;line-height:1;
- background:linear-gradient(145deg,rgba(255,255,255,.15),rgba(255,255,255,.04));
- border:1px solid rgba(255,255,255,.17);
- box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(88,101,242,.12)}
-.badge.ok{color:#57f287;box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(87,242,135,.14)}
-.badge.no{color:#ff6b6b;box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 7px rgba(237,66,69,.16)}
+ background:#ffffff;border:1px solid rgba(255,255,255,.9);
+ box-shadow:0 14px 34px rgba(0,0,0,.6)}
+.badge.ok{box-shadow:0 14px 34px rgba(0,0,0,.6),0 0 0 7px rgba(87,242,135,.18)}
+.badge.no{box-shadow:0 14px 34px rgba(0,0,0,.6),0 0 0 7px rgba(237,66,69,.2)}
 .badge img{width:100%;height:100%;object-fit:cover;border-radius:50%;display:block}
 .eyebrow{position:relative;z-index:1;margin:0 0 9px;font-size:10.5px;font-weight:800;
  letter-spacing:.26em;color:var(--sub);text-transform:uppercase}
@@ -575,13 +564,13 @@ p.msg{position:relative;z-index:1;margin:0;color:#b9c0da;font-size:14.5px;line-h
 p.msg.ok{color:#7beda4}
 p.msg.no{color:#ff8a8a}
 a.btn{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;gap:9px;
- margin-top:24px;padding:15px 20px;border-radius:15px;text-decoration:none;color:#fff;
- font-size:16px;font-weight:700;letter-spacing:-.01em;
- background:linear-gradient(135deg,#5865f2 0%,#7b5cf5 55%,#8b5cf6 100%);
- box-shadow:0 16px 34px rgba(88,101,242,.45),inset 0 1px 0 rgba(255,255,255,.3);
- transition:transform .16s ease,box-shadow .16s ease,filter .16s ease}
-a.btn:hover{transform:translateY(-2px);filter:brightness(1.07);
- box-shadow:0 20px 42px rgba(88,101,242,.6),inset 0 1px 0 rgba(255,255,255,.35)}
+ margin-top:24px;padding:16px 20px;border-radius:14px;text-decoration:none;color:#000000;
+ font-size:16px;font-weight:800;letter-spacing:-.01em;
+ background:#ffffff;
+ box-shadow:0 16px 34px rgba(0,0,0,.6);
+ transition:transform .16s ease,box-shadow .16s ease,background .16s ease}
+a.btn:hover{transform:translateY(-2px);background:#e9eaee;
+ box-shadow:0 20px 42px rgba(0,0,0,.7)}
 a.btn:active{transform:translateY(0)}
 a.btn .arrow{transition:transform .16s ease}
 a.btn:hover .arrow{transform:translateX(5px)}
@@ -600,7 +589,7 @@ def page(title: str, msg: str, ok: bool) -> web.Response:
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<meta name=theme-color content='#0b0e1a'>"
             f"<title>{html.escape(title)}</title><style>{CSS}</style></head><body>"
-            "<div class='orb a'></div><div class='orb b'></div><div class='stage'>"
+            "<div class='stage'>"
             f"<section class='card {cls}'>"
             f"<div class='badge {cls}'>{mark}</div>"
             f"<p class='eyebrow'>{eyebrow}</p>"
@@ -926,7 +915,7 @@ async def index(request: web.Request) -> web.Response:
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
             "<meta name=theme-color content='#0b0e1a'>"
             f"<title>{title}</title><style>{CSS}</style></head><body>"
-            "<div class='orb a'></div><div class='orb b'></div><div class='stage'>"
+            "<div class='stage'>"
             "<section class='card'>"
             f"<div class='badge'>{visual}</div>"
             "<p class='eyebrow'>Discord Verification</p>"
