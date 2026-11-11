@@ -48,14 +48,14 @@ ICON_D = 200
 ICON_X, ICON_Y = 855, 80
 ICON_LABEL_Y = 322
 
-# 색
-BG_TOP = (11, 14, 26)        # #0B0E1A
-BG_BOTTOM = (24, 19, 56)     # #181338
-GLOW_A = (88, 101, 242)      # indigo
-GLOW_B = (139, 92, 246)      # violet
-TEXT_MAIN = (244, 246, 255)
-TEXT_SUB = (176, 183, 214)
-TEXT_MUTED = (128, 136, 170)
+# 색 — 웹 인증 페이지와 같은 무채색 미니멀 (순수 검정 + 흐린 십자 격자 + 흰 글씨)
+GRID = 24                   # 격자 간격(px)
+GRID_RGB = (15, 15, 15)     # 격자선 (검정 위 흰색 약 6%)
+EDGE_RGB = (26, 26, 26)     # 배너 가장자리 한 줄
+TILE_BG = (10, 10, 12)      # 아이콘/아바타 자리 채움색 (#0A0A0C)
+TEXT_MAIN = (255, 255, 255)
+TEXT_SUB = (198, 202, 211)
+TEXT_MUTED = (95, 100, 112)
 
 EYE = {
     "join": ("WELCOME", "환영합니다", (87, 242, 135), discord.Color.from_rgb(59, 165, 93)),
@@ -66,7 +66,6 @@ DEFAULTS = {"channel": None, "enabled": False, "image": True}
 SIDES = ("join", "leave")
 LABEL = {"join": "입장", "leave": "퇴장"}
 _FONT_CACHE: dict = {}
-_FALLOFF: Image.Image | None = None
 
 
 # ---------- 저장소 (입장/퇴장은 각각 완전히 독립) ----------
@@ -282,42 +281,16 @@ def _fit(draw, text: str, size: int, max_w: int, bold: bool = True):
     return f, text
 
 
-def _gradient() -> Image.Image:
-    """45° 대각 그라디언트.
-
-    rotate(-45) 방식은 빈 모서리가 검정으로 채워져 대각 이음새를 남긴다.
-    가로/세로 그라디언트를 합치면 이음새 없이 매끈하다.
-    """
-    h = Image.linear_gradient("L").transpose(Image.ROTATE_90).resize((W, H), Image.BILINEAR)
-    v = Image.linear_gradient("L").resize((W, H), Image.BILINEAR)
-    g = ImageChops.add(h, v, scale=2)  # (가로+세로)/2 → 좌상단 0 → 우하단 255
-    return ImageOps.colorize(g, black=BG_TOP, white=BG_BOTTOM).convert("RGB")
-
-
-def _smoothstep(v: int) -> int:
-    """가운데=255, 반지름 끝=0. 억지로 0을 만들지 않으면 사각 테두리에 이음새가 생긴다."""
-    f = 1.0 - v / 181.0  # radial_gradient = min(255, 거리*√2) → 181 에서 0
-    if f <= 0.0:
-        return 0
-    if f >= 1.0:
-        return 255
-    return int(255 * (f * f * (3.0 - 2.0 * f)))
-
-
-def _falloff() -> Image.Image:
-    """가운데 밝고 가장자리 0인 원형 감쇠 마스크 (계산 결과 캐시)."""
-    global _FALLOFF
-    if _FALLOFF is None:
-        _FALLOFF = Image.radial_gradient("L").point(_smoothstep)
-    return _FALLOFF
-
-
-def _glow(img: Image.Image, color, center, radius: int, strength: float) -> Image.Image:
-    grad = _falloff().resize((radius * 2, radius * 2), Image.BILINEAR)
-    mask = Image.new("L", (W, H), 0)
-    mask.paste(grad, (center[0] - radius, center[1] - radius))
-    mask = mask.point(lambda v: int(v * strength))
-    return Image.composite(Image.new("RGB", (W, H), color), img, mask)
+def _background() -> Image.Image:
+    """순수 검정 배경 + 흐린 십자 격자 (웹 인증 페이지와 같은 무늬)."""
+    img = Image.new("RGB", (W, H), (0, 0, 0))
+    d = ImageDraw.Draw(img)
+    for x in range(0, W + 1, GRID):
+        d.line((x, 0, x, H), fill=GRID_RGB, width=1)
+    for y in range(0, H + 1, GRID):
+        d.line((0, y, W, y), fill=GRID_RGB, width=1)
+    d.rectangle((0, 0, W - 1, H - 1), outline=EDGE_RGB, width=1)
+    return img
 
 
 def _paste_avatar(canvas: Image.Image, data: bytes, accent) -> None:
@@ -345,7 +318,7 @@ def _paste_icon(canvas: Image.Image, data: bytes | None, label: str, accent) -> 
         src = src.crop(((w - side) // 2, (h - side) // 2,
                         (w + side) // 2, (h + side) // 2)).resize((s, s), Image.LANCZOS)
     else:
-        src = Image.new("RGBA", (s, s), (30, 34, 60, 255))
+        src = Image.new("RGBA", (s, s), (*TILE_BG, 255))
         ch = (label or "?").strip()[:1].upper()
         ImageDraw.Draw(src).text((s / 2, s / 2), ch, font=_font(int(s * 0.44), True),
                                  fill=(*accent, 255), anchor="mm")
@@ -353,7 +326,7 @@ def _paste_icon(canvas: Image.Image, data: bytes | None, label: str, accent) -> 
     ImageDraw.Draw(mask).rounded_rectangle((0, 0, s, s), radius=96, fill=255)
     src.putalpha(mask)
     ImageDraw.Draw(src).rounded_rectangle((4, 4, s - 4, s - 4), radius=92,
-                                          outline=(255, 255, 255, 28), width=8)
+                                          outline=(255, 255, 255, 46), width=8)
     src = src.resize((ICON_D, ICON_D), Image.LANCZOS)
     canvas.paste(src, (ICON_X, ICON_Y), src)
 
@@ -364,9 +337,7 @@ def build_banner(kind: str, avatar: bytes | None, name: str, guild_name: str,
     if Image is None:
         raise RuntimeError("Pillow 미설치 — pip install Pillow")
     eye, title, accent, _ = EYE[kind]
-    img = _gradient()
-    img = _glow(img, GLOW_A, (250, 40), 400, 0.50)
-    img = _glow(img, GLOW_B, (W - 120, H - 20), 360, 0.42)
+    img = _background()
     draw = ImageDraw.Draw(img)
 
     # 왼쪽 유저 아바타 (없으면 빈 원)
@@ -374,7 +345,7 @@ def build_banner(kind: str, avatar: bytes | None, name: str, guild_name: str,
         _paste_avatar(img, avatar, accent)
     else:
         draw.ellipse((AVATAR_X, AVATAR_Y, AVATAR_X + AVATAR_D, AVATAR_Y + AVATAR_D),
-                     fill=(28, 32, 56), outline=(*accent, 255), width=6)
+                     fill=TILE_BG, outline=(*accent, 255), width=6)
 
     # 오른쪽 서버 아이콘 — 빈 공간을 메우고 "어느 서버인지"까지 보여줌
     _paste_icon(img, guild_icon, guild_name, accent)
@@ -384,11 +355,11 @@ def build_banner(kind: str, avatar: bytes | None, name: str, guild_name: str,
     # 강조 바
     draw.rounded_rectangle((TEXT_X, BAR_Y, TEXT_X + 56, BAR_Y + 6), radius=3, fill=accent)
 
-    # eyebrow (자간 넓게)
+    # eyebrow (자간 넓게 · 웹 페이지와 같은 무채색)
     f_eye = _font(24, True)
     x = TEXT_X
     for ch in eye:
-        draw.text((x, EYEBROW_Y), ch, font=f_eye, fill=accent, anchor="ls")
+        draw.text((x, EYEBROW_Y), ch, font=f_eye, fill=TEXT_MUTED, anchor="ls")
         x += draw.textlength(ch, font=f_eye) + 7
 
     f, t = _fit(draw, title, 62, max_w, bold=True)
