@@ -1,6 +1,6 @@
-"""Render 웹 API 클라이언트 (봇 → 웹).
+"""웹 API 클라이언트 (봇 → 웹).
 
-봇(디스호스트)과 웹(Render)이 파일을 공유할 수 없어서
+봇(디스호스트)과 웹(별도 무료 호스트)이 파일을 공유할 수 없어서
 토큰·웹훅 같은 공유 데이터는 이 API로 주고받음.
 인증: X-Api-Key 헤더 = WEB_SECRET. 베이스 = WEB_API_URL (없으면 WEB_PUBLIC_URL).
 """
@@ -11,7 +11,7 @@ import aiohttp
 
 from webverify import env
 
-TIMEOUT = aiohttp.ClientTimeout(total=70)  # Render 슬립 깨우는 시간 감안
+TIMEOUT = aiohttp.ClientTimeout(total=70)  # 웹 서버 콜드스타트 깨우는 시간 감안
 
 
 class ApiError(Exception):
@@ -25,7 +25,7 @@ def _base() -> str:
     if explicit:
         return explicit.rstrip("/")
     # WEB_API_URL 이 비면 자기 포트로 직접 붙는다.
-    # Render 통합처럼 봇+웹이 한 프로세스인 경우 쓴다 — PORT 는 런타임에
+    # 봇+웹이 한 프로세스인 경우 쓴다 — PORT 는 런타임에
     # 배정되므로 미리 환경변수에 못 적는다. 외부 URL로 한 바퀴 돌 필요도 없다.
     port = (
         os.getenv("PORT", "").strip()
@@ -66,7 +66,7 @@ async def api_ping() -> bool:
 
 
 async def web_status() -> dict:
-    """웹(Render) 쪽 로그 상태: 등록 웹훅 수 / 대기열 적체 / 마지막 전송 결과."""
+    """웹 쪽 로그 상태: 등록 웹훅 수 / 대기열 적체 / 마지막 전송 결과."""
     return await _req("GET", "/api/ping")
 
 
@@ -87,7 +87,7 @@ async def webhook_remove(guild_id: int) -> bool:
 async def webhook_save(guild_id: int, url: str) -> bool:
     """URL만 저장한다. 전송 테스트는 봇 프로세스에서 이미 보냈으므로 웹은 스킵한다.
 
-    Render IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
+    웹 서버 IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
     웹쪽에서 테스트하면 항상 실패로 보인다.
     """
     d = await _req(
@@ -144,3 +144,44 @@ async def token_clear(guild_id: int, keep: list[str] | None = None) -> int:
         json={"guild": guild_id, "keep": [str(u) for u in (keep or [])]},
     )
     return int(d.get("left", 0))
+
+
+# ---------- 복구키 (DB 는 웹에, 봇은 API 로만 접근) ----------
+async def recovery_ensure(guild_id: int, created_by) -> tuple[str, bool]:
+    """(복구키, 새로만듦 여부). 기존 키 있으면 그대로 돌려준다."""
+    d = await _req(
+        "POST", "/api/recovery/ensure",
+        json={"guild": guild_id, "created_by": str(created_by)},
+    )
+    return str(d.get("key", "")), bool(d.get("is_new"))
+
+
+async def recovery_get(guild_id: int) -> str | None:
+    """이 서버에 등록된 복구키. 없으면 None."""
+    d = await _req("GET", "/api/recovery/get", params={"guild": guild_id})
+    k = d.get("key")
+    return str(k) if k else None
+
+
+async def recovery_find(key: str) -> int | None:
+    """키를 쓰는 서버 ID. 없으면 None."""
+    d = await _req("GET", "/api/recovery/find", params={"key": key})
+    try:
+        return int(d.get("guild_id") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+async def recovery_set(guild_id: int, key: str, created_by) -> str:
+    """복구키를 직접 지정한 값으로 바꾸고 정규화된 새 키를 돌려준다."""
+    d = await _req(
+        "POST", "/api/recovery/set",
+        json={"guild": guild_id, "key": str(key), "created_by": str(created_by)},
+    )
+    return str(d.get("key", ""))
+
+
+async def recovery_delete(guild_id: int) -> bool:
+    """이 서버의 복구키를 없앤다."""
+    d = await _req("POST", "/api/recovery/delete", json={"guild": guild_id})
+    return bool(d.get("removed"))

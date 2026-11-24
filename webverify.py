@@ -14,6 +14,7 @@ import html
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import time
 import urllib.parse
@@ -332,7 +333,7 @@ def build_success_embed(info: dict) -> dict:
 # ---------- Discord API ----------
 HEADERS = {"User-Agent": "DiscordBot (verify-bot, 1.0)"}
 
-# Render 같은 클라우드 IP는 Discord Cloudflare 에서 가끔 429(HTML 챌린지)를 먹인다.
+# 클라우드 IP는 Discord Cloudflare 에서 가끔 429(HTML 챌린지)를 먹인다.
 # 한 번에 포기하지 않도록 잠깐 쉬었다가 다시 시도한다. 4xx(429 제외)는 재시도하지 않는다.
 DISCORD_TRY = 3
 
@@ -499,7 +500,7 @@ def _queue_local_put(items: list[dict]) -> None:
 async def _deliver_webhook(embed: dict, guild_id: int | str | None = None) -> None:
     """로그를 대기열에만 적재한다 (여기서는 보내지 않는다).
 
-    Render IP 는 디스코드 웹훅 POST(`/api/webhooks/`)에 한해 429 를 받아
+    웹 서버 IP 는 디스코드 웹훅 POST(`/api/webhooks/`)에 한해 429 를 받아
     직접 전송이 매번 실패했고, 그 시도(재시도 포함 4초+)가 로그 도착을 늦췄다.
     이제 전송은 봇이 맡는다.
       - 로그 채널: 봇이 **일반 메시지로 직접 전송** → 웹훅 429 와 무관
@@ -878,6 +879,121 @@ async def api_token_clear(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "removed": removed, "left": len(keep)})
 
 
+# ---------- 복구키 (DB는 이 서버에 영구 저장, 봇은 API로만 읽고쓴다) ----------
+# 복구키는 (1) 웹 인증 허용 서버 목록(allowed_guild_ids)과
+# (2) 테러 복구(/복구)의 두 곳에서 쓰인다. 봇과 웹이 파일을 공유할 수 없으므로
+# 봇 쪽 recover.py 는 전부 이 API 를 거친다.
+ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 헷갈리는 문자 제외 (recover.py와 동일)
+
+
+def _new_recovery_key() -> str:
+    return "-".join("".join(secrets.choice(ALPHABET) for _ in range(4)) for _ in range(3))
+
+
+async def api_recovery_ensure(request: web.Request) -> web.Response:
+    """(키, 새로만듦 여부). 기존 키 있으면 그대로 — recover.ensure_key 와 동일한 규칙."""
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        body = await request.json()
+        guild_id = int(body["guild"])
+        created_by = str(body.get("created_by") or "?")
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT key FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
+        ).fetchone()
+        if row:
+            return web.json_response({"key": row[0], "is_new": False})
+        key = _new_recovery_key()
+        con.execute(
+            "INSERT INTO recovery_keys(guild_id, key, created_by, created_at) VALUES(?,?,?,?)",
+            (str(guild_id), key, created_by, int(time.time())),
+        )
+        con.commit()
+        return web.json_response({"key": key, "is_new": True})
+    finally:
+        con.close()
+
+
+async def api_recovery_get(request: web.Request) -> web.Response:
+    """이 서버에 등록된 복구키. 없으면 key=None."""
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        guild_id = int(request.query["guild"])
+    except (KeyError, ValueError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT key FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
+        ).fetchone()
+        return web.json_response({"key": row[0] if row else None})
+    finally:
+        con.close()
+
+
+async def api_recovery_find(request: web.Request) -> web.Response:
+    """키를 쓰는 서버 ID. 없으면 guild_id=None."""
+    if (r := need_auth(request)) is not None:
+        return r
+    key = request.query.get("key", "").strip().upper()
+    if not key:
+        return web.json_response({"detail": "key 필요"}, status=400)
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT guild_id FROM recovery_keys WHERE key=?", (key,)
+        ).fetchone()
+        return web.json_response({"guild_id": row[0] if row else None})
+    finally:
+        con.close()
+
+
+async def api_recovery_set(request: web.Request) -> web.Response:
+    """복구키를 직접 지정한 값으로 바꾼다 (기존 키는 삭제). 정규화된 새 키를 반환."""
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        body = await request.json()
+        guild_id = int(body["guild"])
+        norm = str(body["key"]).strip().upper()
+        created_by = str(body.get("created_by") or "?")
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"detail": "guild/key 필요"}, status=400)
+    con = db()
+    try:
+        con.execute("DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),))
+        con.execute(
+            "INSERT INTO recovery_keys(guild_id, key, created_by, created_at) VALUES(?,?,?,?)",
+            (str(guild_id), norm, created_by, int(time.time())),
+        )
+        con.commit()
+        return web.json_response({"key": norm})
+    finally:
+        con.close()
+
+
+async def api_recovery_delete(request: web.Request) -> web.Response:
+    """이 서버의 복구키를 없앤다. 쌓인 인원(토큰)은 guild 기준이라 남아 있다."""
+    if (r := need_auth(request)) is not None:
+        return r
+    try:
+        guild_id = int((await request.json())["guild"])
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"detail": "guild 필요"}, status=400)
+    con = db()
+    try:
+        cur = con.execute("DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),))
+        con.commit()
+        return web.json_response({"removed": cur.rowcount > 0})
+    finally:
+        con.close()
+
+
 # ---------- 라우트 ----------
 async def index(request: web.Request) -> web.Response:
     try:
@@ -930,7 +1046,7 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def callback(request: web.Request) -> web.Response:
-    # OAUTH_FORWARD 가 있으면(Render) 토큰 교환이 막히는 그 서버에서 처리하지 않고
+    # OAUTH_FORWARD 가 있으면 토큰 교환이 막히는 그 서버에서 처리하지 않고
     # 옮겨놓은 서버로 그대로 넘긴다. 디스코드 리다이렉트 주소는 그대로 써도 된다.
     fwd = env("OAUTH_FORWARD")
     if fwd:
@@ -1090,4 +1206,9 @@ def create_app() -> web.Application:
     app.router.add_get("/api/backup-users", api_backup_users)
     app.router.add_post("/api/token-save", api_token_save)
     app.router.add_post("/api/token-clear", api_token_clear)
+    app.router.add_post("/api/recovery/ensure", api_recovery_ensure)
+    app.router.add_get("/api/recovery/get", api_recovery_get)
+    app.router.add_get("/api/recovery/find", api_recovery_find)
+    app.router.add_post("/api/recovery/set", api_recovery_set)
+    app.router.add_post("/api/recovery/delete", api_recovery_delete)
     return app

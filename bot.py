@@ -62,7 +62,7 @@ class Config:
     auth_channel_id: int | None = _get_int("AUTH_CHANNEL_ID")
     log_channel_id: int | None = _get_int("LOG_CHANNEL_ID")
     min_account_age_days: int = int(os.getenv("MIN_ACCOUNT_AGE_DAYS", "7") or 7)
-    # 디스호스트는 SERVER_PORT 를 준다. 로컬/Render 는 PORT, 그 외 WEB_PORT.
+    # 디스호스트는 SERVER_PORT 를 준다. 로컬은 PORT, 그 외 WEB_PORT.
     web_port: int = int(
         os.getenv("PORT", "")
         or os.getenv("WEB_PORT", "")
@@ -500,7 +500,7 @@ async def refresh_verify_panels(
 
 
 # ---------- 로그 대기열 봇이 대신 전송 ----------
-# Render IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
+# 웹 서버 IP 는 디스코드 웹훅 POST 제한(429)을 받는 경우가 있어
 # 웹에서 직접 못 보낸 인증 로그는 대기열에 남고, 봇은 여기서 꺼내 직접 보낸다.
 def _queue_interval() -> float:
     try:
@@ -643,12 +643,12 @@ async def _pump_log_queue() -> None:
                 _API_FAIL_LOG_AT = now
                 if "unauthorized" in detail.lower():
                     log.warning(
-                        "웹(Render) API 인증 거부(401) — 봇 WEB_SECRET 과 "
-                        "Render Env WEB_SECRET 이 다릅니다. "
+                        "웹 API 인증 거부(401) — 봇 WEB_SECRET 과 "
+                        "웹 서버 Env WEB_SECRET 이 다릅니다. "
                         "/인증로그 → [🔍 로그 상태] 에서 확인하세요 (1분에 1회만 표시)"
                     )
                 else:
-                    log.warning("웹(Render) API 오류 (1분에 1회만 표시): %s", detail)
+                    log.warning("웹 API 오류 (1분에 1회만 표시): %s", detail)
         except Exception:
             log.exception("로그 대기열 전송 중 오류")
         await asyncio.sleep(delay)
@@ -912,7 +912,7 @@ async def on_ready():
     # 잡히고 기존 서버도 재접속 때 알아서 채워진다. (별도 ALLOWED_GUILDS 설정 불필요)
     try:
         for g in bot.guilds:
-            recover.ensure_key(g.id, str(bot.user.id) if bot.user else "?")
+            await recover.ensure_key(g.id, str(bot.user.id) if bot.user else "?")
         log.info("웹 인증 허용 서버 자동 등록: %d개", len(bot.guilds))
     except Exception:
         log.exception("허용 서버 자동 등록 실패")
@@ -921,7 +921,7 @@ async def on_ready():
     if not _PANEL_REFRESH_DONE:
         _PANEL_REFRESH_DONE = True
         await _refresh_all_panels()
-    # 웹(Render)이 직접 못 보낸 인증 로그를 봇 IP 로 대신 전송하도록 띄운다.
+    # 웹이 직접 못 보낸 인증 로그를 봇 IP 로 대신 전송하도록 띄운다.
     _start_log_pump()
     # 오류 자동 보고 펌프 (/오류보고)
     _start_err_reports()
@@ -934,7 +934,7 @@ async def on_guild_join(guild: discord.Guild):
     assert me is not None
     inviter = await recover.find_inviter(guild, me.id)
     target = inviter or guild.owner
-    key, _ = recover.ensure_key(guild.id, target.id if target else "?")
+    key, _ = await recover.ensure_key(guild.id, target.id if target else "?")
     text = (
         f"🔑 **{guild.name} 서버의 복구키가 발급됐습니다**\n"
         f"`{key}`\n\n"
@@ -1211,7 +1211,7 @@ class WebhookModal(discord.ui.Modal, title="인증 로그 웹훅"):
             )
             return
         # 테스트는 봇 프로세스에서 직접 보낸다.
-        # Render IP 는 디스코드 웹훅 POST 제한(429)을 받아 웹쪽 검사는
+        # 웹 서버 IP 는 디스코드 웹훅 POST 제한(429)을 받아 웹쪽 검사는
         # 정상 주소도 항상 실패로 보이기 때문.
         ok, detail = await webverify.post_webhook(url, _WEBHOOK_TEST_PAYLOAD)
         saved = False
@@ -1369,7 +1369,7 @@ class VerifyLogView(discord.ui.View):
             items = await webapi.queue_take()
         except webapi.ApiError as e:
             await interaction.followup.send(
-                "❌ 웹(Render) 서버에 연결 못했어요: "
+                "❌ 웹(인증) 서버에 연결 못했어요: "
                 f"`{' '.join(str(e).split())[:200]}`",
                 ephemeral=True,
             )
@@ -1399,7 +1399,7 @@ class VerifyLogView(discord.ui.View):
             n = await webapi.queue_clear()
         except webapi.ApiError as e:
             await interaction.followup.send(
-                "❌ 웹(Render) 서버에 연결 못했어요: "
+                "❌ 웹(인증) 서버에 연결 못했어요: "
                 f"`{' '.join(str(e).split())[:200]}`",
                 ephemeral=True,
             )
@@ -1445,10 +1445,10 @@ class VerifyLogView(discord.ui.View):
             d = await webapi.web_status()
         except webapi.ApiError as e:
             await interaction.followup.send(
-                "❌ 웹(Render) 서버에 연결 못했어요.\n"
+                "❌ 웹(인증) 서버에 연결 못했어요.\n"
                 f"`{' '.join(str(e).split())[:200]}`\n"
-                "→ Render 가 꺼져 있거나, 봇 환경변수 `WEB_PUBLIC_URL` / `WEB_SECRET` "
-                "이 Render 쪽 값과 다르면 이럽니다.",
+                "→ 웹 서버가 꺼져 있거나, 봇 환경변수 `WEB_PUBLIC_URL` / `WEB_SECRET` "
+                "이 웹 서버 쪽 값과 다르면 이럽니다.",
                 ephemeral=True,
             )
             return
@@ -1472,7 +1472,7 @@ class VerifyLogView(discord.ui.View):
             when = datetime.fromtimestamp(int(last["ts"])).strftime("%H:%M:%S")
             ok = bool(last.get("ok"))
             lines.append(
-                f"· 웹(Render) 마지막 전송: "
+                f"· 웹 마지막 전송: "
                 f"{'✅ 성공' if ok else '❌ 실패'} (`{when}`)"
             )
             if last.get("detail"):
@@ -1481,7 +1481,7 @@ class VerifyLogView(discord.ui.View):
                 lines.append("  → 봇 대기열로 넘겼습니다.")
         else:
             lines.append(
-                "· 웹(Render) 마지막 전송: 기록 없음 (웹 인증이 아직 한 번도 안 일어났음)"
+                "· 웹 마지막 전송: 기록 없음 (웹 인증이 아직 한 번도 안 일어났음)"
             )
         if _LOG_PUMP_LAST.get("ts"):
             when = datetime.fromtimestamp(int(_LOG_PUMP_LAST["ts"])).strftime("%H:%M:%S")
@@ -1495,9 +1495,8 @@ class VerifyLogView(discord.ui.View):
                 lines.append(f"  - `{_detail[:120]}`")
             if "unauthorized" in _detail.lower():
                 lines.append(
-                    "  ⚠️ **401 거부** → 봇 Env 와 **Render Env 의 `WEB_SECRET` 이 다릅니다.**\n"
-                    "     Render(웹) → Env 탭에서 `WEB_SECRET` 값 확인해서\n"
-                    "     **Bot-Hosting Env의 `WEB_SECRET` 을 그 값으로 바꿔 저장**하면 끝나요."
+                    "  ⚠️ **401 거부** → 봇 Env 와 **웹 서버 Env 의 `WEB_SECRET` 이 다릅니다.**\n"
+                    "     봇(디스호스트)·웹 서버 양쪽의 `WEB_SECRET` 을 같은 값으로 맞춰 저장하면 끝나요."
                 )
         else:
             lines.append("· 봇 마지막 대기열 처리: 아직 안 돌았어요 (재시작 후 5초~)")
@@ -1536,7 +1535,7 @@ class RecoverModal(discord.ui.Modal, title="복구"):
             await _deny(interaction)
             return
         key = str(self.key.value).strip()
-        gid = recover.key_to_guild(key)
+        gid = await recover.key_to_guild(key)
         if gid is None:
             await interaction.response.send_message(
                 "❌ 유효하지 않은 복구키입니다.", ephemeral=True
@@ -1588,7 +1587,7 @@ class RecoverConfirmView(discord.ui.View):
         if not _verify_admin_ok(interaction):
             await _deny(interaction)
             return
-        gid = recover.key_to_guild(key)
+        gid = await recover.key_to_guild(key)
         if gid is None:
             await interaction.response.send_message(
                 "❌ 유효하지 않은 복구키입니다.", ephemeral=True
@@ -1668,15 +1667,15 @@ class RecoverKeySetModal(discord.ui.Modal, title="복구키 직접 설정"):
                 "❌ 영문·숫자·하이픈만 쓸 수 있고 4~64자여야 해요.", ephemeral=True
             )
             return
-        owner = recover.key_to_guild(raw)
+        owner = await recover.key_to_guild(raw)
         if owner is not None and owner != guild.id:
             await interaction.response.send_message(
                 "❌ 이미 다른 서버가 쓰는 복구키예요. 다른 값을 정해주세요.",
                 ephemeral=True,
             )
             return
-        old = recover.get_key(guild.id)
-        new = recover.set_key(guild.id, raw, interaction.user.id)
+        old = await recover.get_key(guild.id)
+        new = await recover.set_key(guild.id, raw, interaction.user.id)
         await interaction.response.send_message(
             f"✅ 복구키를 `{new}` 로 바꿨어요."
             + (f"\n이전 키 `{old}` 는 더 이상 쓸 수 없어요." if old else "")
@@ -1705,13 +1704,13 @@ class RecoverKeyDeleteView(discord.ui.View):
         if not _verify_admin_ok(interaction):
             await _deny(interaction)
             return
-        key = recover.get_key(guild.id)
+        key = await recover.get_key(guild.id)
         if key is None:
             await interaction.response.edit_message(
                 content="🗑 이미 삭제된 키였어요.", embed=None, view=None
             )
             return
-        recover.delete_key(guild.id)
+        await recover.delete_key(guild.id)
         await interaction.response.edit_message(
             content=(
                 f"🗑 복구키 `{key}` 를 삭제했어요.\n"
@@ -1990,7 +1989,7 @@ class VerifyAdminView(discord.ui.View):
         if not _verify_admin_ok(interaction):
             await _deny(interaction)
             return
-        key, is_new = recover.ensure_key(guild.id, interaction.user.id)
+        key, is_new = await recover.ensure_key(guild.id, interaction.user.id)
         text = (
             f"🔑 **{guild.name} 서버의 복구키**\n`{key}`\n\n"
             f"• 이 서버에서 웹 인증하는 사람이 이 키 앞으로 자동 누적됩니다.\n"
@@ -2023,7 +2022,7 @@ class VerifyAdminView(discord.ui.View):
         if not _verify_admin_ok(interaction):
             await _deny(interaction)
             return
-        key, is_new = recover.ensure_key(guild.id, interaction.user.id)
+        key, is_new = await recover.ensure_key(guild.id, interaction.user.id)
         lines = [
             f"🔑 **{guild.name} — 지금 쓰고 있는 복구키**",
             f"`{key}`",
@@ -2055,7 +2054,7 @@ class VerifyAdminView(discord.ui.View):
         if not _verify_admin_ok(interaction):
             await _deny(interaction)
             return
-        key = recover.get_key(guild.id)
+        key = await recover.get_key(guild.id)
         if key is None:
             await interaction.response.send_message(
                 "ℹ️ 이 서버엔 등록된 복구키가 없어요.", ephemeral=True
@@ -2865,7 +2864,7 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
         pass
 
 
-# 시작 실패 원인을 밖에서 읽을 수 있게 남긴다 (Render 로그 뷰어가 마지막 줄만
+# 시작 실패 원인을 밖에서 읽을 수 있게 남긴다 (호스팅 콘솔이 마지막 줄만
 # 보여주는 탓에 트레이스백이 잘려나가서). /lasterror?key=WEB_SECRET 로 확인.
 STARTUP_ERROR = ""
 SEED_STATUS = "not run"
@@ -2880,7 +2879,7 @@ _PROBE_VAL = "not probed"
 
 
 async def _discord_probe() -> str:
-    """Render 서버의 아웃바운드 IP와 Discord 엣지 차단 여부를 확인한다."""
+    """호스팅 서버의 아웃바운드 IP와 Discord 엣지 차단 여부를 확인한다."""
     global _PROBE_AT, _PROBE_VAL
     now = time.time()
     if _PROBE_VAL != "not probed" and now - _PROBE_AT < 600:
@@ -2960,12 +2959,12 @@ async def _lasterror(request: web.Request) -> web.Response:
 def _restore_seed() -> None:
     """호스팅 이전 때 상태 파일이 **하나라도 없으면** 그 파일만 채운다.
 
-    Render 같은 곳은 git 배포만 되는데 `panels.json`·`roles.json`·`tickets.json`·
+    호스팅이 git 배포만 되는 곳은 `panels.json`·`roles.json`·`tickets.json`·
     `verifications.db` 는 git 대상이 아니다(공개 저장소라 절대 올리면 안 된다).
     그래서 이 파일들을 `SEED_B64` (tar.gz → base64) 환경변수로 들고 와서 채운다.
 
     ⚠️ 핵심 규칙: **이미 있는 파일은 절대 덮어쓰지 않는다.**
-    Render 무료는 배포할 때 디스크를 초기화하니 그때만 시드로 되살아나고,
+    무료 플랜은 배포할 때 디스크를 초기화하니 그때만 시드로 되살아나고,
     평소 재시작·슬립 해제 때는 살아있는 인증 기록·티켓 기록을 건드린다.
     (이전에 마커 파일로 "한 번만" 판정했더니 배포 후 디스크 초기화로 마커까지
      날아가 재시작마다 덮어쓸 뻔했어서 파일 존재 판정으로 바꿈)
@@ -3041,7 +3040,7 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", config.web_port).start()
         log.info("웹 실행: 포트 %s (/health)", config.web_port)
     if do_bot:
-        # 봇 시작이 실패해도 웹(/health)은 살려둔다. Render 무료 플랜은 인스턴스가
+        # 봇 시작이 실패해도 웹(/health)은 살려둔다. 호스팅 콘솔은 인스턴스가
         # 죽으면 라이브 로그를 아예 못 보여줘서 트레이스백을 읽을 수 없다.
         # 살아있는 동안 /lasterror 로 원인을 읽으며 재시도한다.
         #
@@ -3098,7 +3097,7 @@ if __name__ == "__main__":
         # 패널의 Stop/재시작이 보내는 중지 신호. 스택트레이스 대신 한 줄로 정리.
         print("\n⏹ 중지 신호를 받아 종료했습니다.", flush=True)
     except BaseException as exc:  # noqa: BLE001 — 호스팅 로그에 "왜 죽었는지" 마지막 줄로 남긴다
-        # Render 로그 뷰어는 마지막 N줄만 보여주고, 예외 메시지가 긴 HTML이면
+        # 호스팅 콘솔은 마지막 N줄만 보여주고, 예외 메시지가 긴 HTML이면
         # 트레이스백 헤더가 잘려나간다. 그래서 요약 한 줄을 가장 마지막에 찍는다.
         print(traceback.format_exc(), flush=True)
         status = getattr(exc, "status", None) or getattr(

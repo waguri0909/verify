@@ -7,65 +7,31 @@
 
 import asyncio
 import logging
-import secrets
 import time
 
 import aiohttp
 import discord
 
 import webapi
-from webverify import API, HEADERS, db, env
+from webverify import API, HEADERS, env
 
 log = logging.getLogger("recover")
 
-ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 헷갈리는 문자 제외
+
+# 복구키 DB는 웹(webverify)에 영구 저장된다 — 봇은 전부 webapi 를 거친다.
+# (파일을 공유할 수 없는 분리 배포 구조. 아래5개가 그 래퍼다)
+async def ensure_key(guild_id: int, created_by) -> tuple[str, bool]:
+    """(복구키, 새로만듦 여부). 기존 키 있으면 그대로 반환."""
+    return await webapi.recovery_ensure(guild_id, created_by)
 
 
-def new_key() -> str:
-    return "-".join("".join(secrets.choice(ALPHABET) for _ in range(4)) for _ in range(3))
+async def key_to_guild(key: str) -> int | None:
+    return await webapi.recovery_find(key)
 
 
-def ensure_key(guild_id: int, created_by: str) -> tuple[str, bool]:
-    """(복구키, 새로만듦여부). 기존 키 있으면 그대로 반환."""
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT key FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
-        ).fetchone()
-        if row:
-            return row[0], False
-        key = new_key()
-        con.execute(
-            "INSERT INTO recovery_keys(guild_id, key, created_by, created_at) VALUES(?,?,?,?)",
-            (str(guild_id), key, str(created_by), int(time.time())),
-        )
-        con.commit()
-        return key, True
-    finally:
-        con.close()
-
-
-def key_to_guild(key: str) -> int | None:
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT guild_id FROM recovery_keys WHERE key=?", (key.strip().upper(),)
-        ).fetchone()
-        return int(row[0]) if row else None
-    finally:
-        con.close()
-
-
-def get_key(guild_id: int) -> str | None:
+async def get_key(guild_id: int) -> str | None:
     """이 서버에 등록된 복구키. 없으면 None."""
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT key FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
-        ).fetchone()
-        return row[0] if row else None
-    finally:
-        con.close()
+    return await webapi.recovery_get(guild_id)
 
 
 def valid_key(key: str) -> bool:
@@ -74,41 +40,21 @@ def valid_key(key: str) -> bool:
     return 4 <= len(k) <= 64 and all(c.isalnum() or c == "-" for c in k)
 
 
-def set_key(guild_id: int, key: str, created_by: str) -> str:
+async def set_key(guild_id: int, key: str, created_by) -> str:
     """이 서버의 복구키를 직접 지정한 값으로 바꾼다. 정규화된 새 키를 돌려준다.
 
     기존 키는 삭제되므로 그 키로는 복구할 수 없게 된다.
     웹에 쌓인 인원은 guild 기준이라 그대로 남아 있다.
     """
-    norm = key.strip().upper()
-    con = db()
-    try:
-        con.execute("DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),))
-        con.execute(
-            "INSERT INTO recovery_keys(guild_id, key, created_by, created_at)"
-            " VALUES(?,?,?,?)",
-            (str(guild_id), norm, str(created_by), int(time.time())),
-        )
-        con.commit()
-        return norm
-    finally:
-        con.close()
+    return await webapi.recovery_set(guild_id, key, created_by)
 
 
-def delete_key(guild_id: int) -> bool:
+async def delete_key(guild_id: int) -> bool:
     """이 서버의 복구키를 없앤다. 키가 사라지면 /복구 에서 쓸 수 없다.
 
     쌓인 인원(토큰)은 guild 기준이라 남아 있으므로, 키를 다시 만들면 그대로 이어진다.
     """
-    con = db()
-    try:
-        cur = con.execute(
-            "DELETE FROM recovery_keys WHERE guild_id=?", (str(guild_id),)
-        )
-        con.commit()
-        return cur.rowcount > 0
-    finally:
-        con.close()
+    return await webapi.recovery_delete(guild_id)
 
 
 async def backup_count(guild_id: int) -> int:

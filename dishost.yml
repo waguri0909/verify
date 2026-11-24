@@ -1,0 +1,12 @@
+# DisHost 배포 설정 (github.com/waguri0909/verify → push 시 자동 배포)
+name: verify-shift
+language: python
+startup: python main.py
+build: pip install -r requirements.txt
+env:
+  # 봇 전용 모드 — 웹 인증 서버는 별도 호스트(web_main.py)에서 돌린다
+  DISABLE_WEB: "1"
+  TZ: Asia/Seoul
+git:
+  autoDeploy: true
+  branch: main

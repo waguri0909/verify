@@ -1,0 +1,9 @@
+{
+  "name": "verify-shift",
+  "language": "python",
+  "entrypoint": "main.py",
+  "env": {
+    "TZ": "Asia/Seoul",
+    "DISABLE_WEB": "1"
+  }
+}
